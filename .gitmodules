@@ -1,0 +1,3 @@
+[submodule "zarrify-across-network"]
+	path = zarrify-across-network
+	url = https://github.com/ariellubonja/zarrify-across-network.git
