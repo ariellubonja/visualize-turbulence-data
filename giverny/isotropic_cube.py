@@ -5,6 +5,7 @@ import glob
 import math
 import zarr
 import shutil
+import logging
 import pathlib
 import warnings
 import subprocess
@@ -24,9 +25,26 @@ except ImportError:
     subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'morton-py'])
 finally:
     import morton
+    
+# installs sympy if necessary.
+try:
+    import sympy
+except ImportError:
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'sympy'])
+    
+# installs pyJHTDB if necessary.
+try:
+    import pyJHTDB
+except ImportError:
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'pyJHTDB'])
+finally:
+    import pyJHTDB
 
-class iso_cube:
-    def __init__(self, dataset_title = '', output_path = '', cube_dimensions = 3):
+class iso_cube():
+    def __init__(self, dataset_title = '', output_path = '', auth_token = '', cube_dimensions = 3, rewrite_dataset_metadata = False, rewrite_interpolation_metadata = False):
+        """
+        initialize the class.
+        """
         # turn off the dask warning for scattering large objects to the workers.
         warnings.filterwarnings("ignore", message = ".*Large object of size.*detected in task graph")
         
@@ -42,6 +60,9 @@ class iso_cube:
         bits = int(math.log(self.N, 2))
         self.mortoncurve = morton.Morton(dimensions = cube_dimensions, bits = bits)
         
+        # interpolation lookup table resolution.
+        self.lookup_N = 10**5
+        
         # turbulence dataset name, e.g. "isotropic8192" or "isotropic1024fine".
         self.dataset_title = dataset_title
         
@@ -53,31 +74,68 @@ class iso_cube:
         if self.output_path == '':
             self.output_path = pathlib.Path(f'/home/idies/workspace/Temporary/{user}/scratch/turbulence_output')
         else:
-            self.output_path = pathlib.Path(self.output_path).joinpath('turbulence_output')
+            self.output_path = pathlib.Path(self.output_path)
+        
+        # initialize lJHTDB and add the user's authorization token.
+        self.lJHTDB = pyJHTDB.libJHTDB()
+        self.lJHTDB.initialize()
+        self.lJHTDB.add_token(auth_token)
         
         # create the output directory if it does not already exist.
         create_output_folder(self.output_path)
         
-        # set the directory for saving and reading the pickled files.
-        self.pickle_dir = pathlib.Path(f'/home/idies/workspace/turb/data01_01/zarr/turbulence_pickled_test')
-        # create the pickled directory if it does not already exist.
-        create_output_folder(self.pickle_dir)
+        # set the directory for reading the pickled files.
+        self.pickle_dir = pathlib.Path(f'/home/idies/workspace/turb/data01_01/zarr/turbulence_pickled')
         
-        # get a cache of the metadata for the database files.
-        self.init_cache()
+        # set the backup directory for reading the pickled files.
+        self.pickle_dir_backup = pathlib.Path(f'/home/idies/workspace/turb/data02_01/zarr/turbulence_pickled_back')
+        
+        # set the local directory for writing the pickled metadata files if the primary and backup directories are inaccessible.
+        self.pickle_dir_local = pathlib.Path(f'/home/idies/workspace/Temporary/{user}/scratch/turbulence_pickled')
+        
+        # create the local pickle directory if it does not already exist.
+        create_output_folder(self.pickle_dir_local)
+        
+        # retrieve the list of datasets processed by the giverny code.
+        giverny_datasets = get_giverny_datasets()
+        
+        """
+        read/write metadata files.
+        """
+        # only read/write the metadata files if the dataset being queried is handled by this code.
+        if self.dataset_title in giverny_datasets:
+            # get a cache of the metadata for the database files.
+            self.init_cache(read_metadata = True, rewrite_metadata = rewrite_dataset_metadata)
+
+            # get map of the filepaths for all of the dataset files.
+            self.init_filepaths(self.dataset_title, read_metadata = True, rewrite_metadata = rewrite_dataset_metadata)
+
+            # get a map of the files to cornercodes for all of the dataset files.
+            self.init_cornercode_file_map(self.dataset_title, self.N, read_metadata = True, rewrite_metadata = rewrite_dataset_metadata)
+
+            # rewrite interpolation metadata files if specified.
+            if rewrite_interpolation_metadata:
+                # initialize the interpolation lookup table.
+                self.init_interpolation_lookup_table(read_metadata = False, rewrite_metadata = rewrite_interpolation_metadata)
+
+                # initialize the interpolation cube size lookup table.
+                self.init_interpolation_cube_size_lookup_table(read_metadata = False, rewrite_metadata = rewrite_interpolation_metadata)
     
     """
     initialization functions.
     """
-    def init_cache(self):
-        # pickled file for saving the globbed filepaths.
-        pickle_file = self.pickle_dir.joinpath(self.dataset_title + '_metadata.pickle')
+    def init_cache(self, read_metadata = False, rewrite_metadata = False):
+        """
+        pickled SQL metadata.
+        """
+        # pickled SQL metadata.
+        pickle_filename = self.dataset_title + '_metadata.pickle'
+        pickle_file_prod = self.pickle_dir.joinpath(pickle_filename)
+        pickle_file_back = self.pickle_dir_backup.joinpath(pickle_filename)
+        pickle_file_local = self.pickle_dir_local.joinpath(pickle_filename)
         
-        try:
-            # try reading the pickled file.
-            with open(pickle_file, 'rb') as pickled_filepath:
-                self.cache = dill.load(pickled_filepath)
-        except FileNotFoundError:
+        # check if the pickled file is accessible.
+        if not (pickle_file_prod.is_file() or pickle_file_back.is_file() or pickle_file_local.is_file()) or rewrite_metadata:
             # read SQL metadata for all of the turbulence data files into the cache.
             sql = f"""
             select dbm.ProductionDatabaseName
@@ -89,22 +147,23 @@ class iso_cube:
             """
             df = cj.executeQuery(sql, "turbinfo")
             
-            if self.dataset_title == 'sabl2048b' or self.dataset_title == 'sabl2048a':
-                # adds in the missing sql metadata for the 'sabl2048b' dataset.
-                pickle_filename_morton_map = self.pickle_dir.joinpath('20230818-' + self.dataset_title + '_filename_morton_ranges.pickle')
-                
-                # try reading the pickled file.
-                with open(pickle_filename_morton_map, 'rb') as pickled_filepath:
-                     cache_filename_map = dill.load(pickled_filepath)
-                
+            # retrieve the list of datasets that need their sql metadata manually created.
+            sql_metadata_datasets = get_manual_sql_metadata_datasets()
+
+            if self.dataset_title in sql_metadata_datasets:
+                 # get the common filename prefix for all files in this dataset, e.g. "iso8192" for the isotropic8192 dataset.
+                dataset_filename_prefix = get_filename_prefix(self.dataset_title)
+
+                # adds in the missing sql metadata for the dataset in sql_metadata_datasets.
                 df_update = []
-                for filename_key in cache_filename_map:
-                    min_max_morton = cache_filename_map[filename_key]
-                    
+                for index in range(1, 64 + 1):
+                    filename_key = dataset_filename_prefix + str(index).zfill(2)
+                    min_max_morton = ((index - 1) * 512**3, index * 512**3 - 1)
+
                     df_update.append({'ProductionDatabaseName': filename_key.strip(), 'minLim': min_max_morton[0], 'maxLim': min_max_morton[1]})
-                
+
                 df = pd.concat([df, pd.DataFrame(df_update)], ignore_index = True)
-            
+
             x, y, z = self.mortoncurve.unpack(df['minLim'].values)
             df['x_min'] = x
             df['y_min'] = y
@@ -114,59 +173,68 @@ class iso_cube:
             df['x_max'] = x
             df['y_max'] = y 
             df['z_max'] = z
-            
-            self.cache = df
-            
-            # save self.cache to a pickled file.
-            with open(pickle_file, 'wb') as pickled_filepath:
-                dill.dump(self.cache, pickled_filepath)
-        # print(self.cache) # Debugging chunk assignment
-    
-    def get_turb_folders(self):
-        # specifies the folders on fileDB that should be searched for the primary copies of the zarr files.
-        folder_base = '/home/idies/workspace/turb/'
-        folder_paths = ['data01_01/zarr/', 'data01_02/zarr/', 'data01_03/zarr/',
-                        'data02_01/zarr/', 'data02_02/zarr/', 'data02_03/zarr/',
-                        'data03_01/zarr/', 'data03_02/zarr/', 'data03_03/zarr/',
-                        'data04_01/zarr/', 'data04_02/zarr/', 'data04_03/zarr/',
-                        'data05_01/zarr/', 'data05_02/zarr/', 'data05_03/zarr/',
-                        'data06_01/zarr/', 'data06_02/zarr/', 'data06_03/zarr/',
-                        'data07_01/zarr/', 'data07_02/zarr/', 'data07_03/zarr/',
-                        'data08_01/zarr/', 'data08_02/zarr/', 'data08_03/zarr/',
-                        'data09_01/zarr/', 'data09_02/zarr/', 'data09_03/zarr/',
-                        'data10_01/zarr/', 'data10_02/zarr/', 'data10_03/zarr/',
-                        'data11_01/zarr/', 'data11_02/zarr/', 'data11_03/zarr/',
-                        'data12_01/zarr/', 'data12_02/zarr/', 'data12_03/zarr/']
+
+            tmp_cache = df
+
+            # save tmp_cache to a pickled file.
+            with open(pickle_file_local, 'wb') as pickled_filepath:
+                dill.dump(tmp_cache, pickled_filepath)
+                    
+        if read_metadata:
+            self.cache = self.read_pickle_file(pickle_filename)
         
-        return [folder_base + folder_path for folder_path in folder_paths]
+    def init_filepaths(self, dataset_title, read_metadata = False, rewrite_metadata = False):
+        """
+        pickled filepaths.
+        """
+        # pickled production filepaths.
+        pickle_filename = dataset_title + '_database_filepaths.pickle'
+        pickle_file_prod = self.pickle_dir.joinpath(pickle_filename)
+        pickle_file_back = self.pickle_dir_backup.joinpath(pickle_filename)
+        pickle_file_local = self.pickle_dir_local.joinpath(pickle_filename)
         
-    def init_filepaths(self):
-        # production metadata.
-        # -----
-        # pickled file for saving the globbed filepaths.
-        pickle_file = self.pickle_dir.joinpath(self.dataset_title + '_database_filepaths.pickle')
+        # pickled backup filepaths.
+        pickle_filename_backup = dataset_title + '_database_filepaths_backup.pickle'
+        pickle_file_prod_backup = self.pickle_dir.joinpath(pickle_filename_backup)
+        pickle_file_back_backup = self.pickle_dir_backup.joinpath(pickle_filename_backup)
+        pickle_file_local_backup = self.pickle_dir_local.joinpath(pickle_filename_backup)
         
-        try:
-            if self.rewrite_metadata:
-                raise FileNotFoundError
+        # check if the pickled files are accessible.
+        if not (pickle_file_prod.is_file() or pickle_file_back.is_file() or pickle_file_local.is_file()) or \
+            not (pickle_file_prod_backup.is_file() or pickle_file_back_backup.is_file() or pickle_file_local_backup.is_file()) or \
+            rewrite_metadata:
+            # specifies the folders on fileDB that should be searched for the primary and backup copies of the zarr files.
+            folder_base = '/home/idies/workspace/turb/'
+            folder_paths = ['data01_01/zarr/', 'data01_02/zarr/', 'data01_03/zarr/',
+                            'data02_01/zarr/', 'data02_02/zarr/', 'data02_03/zarr/',
+                            'data03_01/zarr/', 'data03_02/zarr/', 'data03_03/zarr/',
+                            'data04_01/zarr/', 'data04_02/zarr/', 'data04_03/zarr/',
+                            'data05_01/zarr/', 'data05_02/zarr/', 'data05_03/zarr/',
+                            'data06_01/zarr/', 'data06_02/zarr/', 'data06_03/zarr/',
+                            'data07_01/zarr/', 'data07_02/zarr/', 'data07_03/zarr/',
+                            'data08_01/zarr/', 'data08_02/zarr/', 'data08_03/zarr/',
+                            'data09_01/zarr/', 'data09_02/zarr/', 'data09_03/zarr/',
+                            'data10_01/zarr/', 'data10_02/zarr/', 'data10_03/zarr/',
+                            'data11_01/zarr/', 'data11_02/zarr/', 'data11_03/zarr/',
+                            'data12_01/zarr/', 'data12_02/zarr/', 'data12_03/zarr/']
             
-            # try reading the pickled file.
-            with open(pickle_file, 'rb') as pickled_filepath:
-                self.filepaths = dill.load(pickled_filepath)
-        except FileNotFoundError:
-            # map the filepaths to the part of each filename that matches "ProductionDatabaseName" in the SQL metadata for this dataset.
-            self.filepaths = {}
+            turb_folders = [folder_base + folder_path for folder_path in folder_paths]
             
             # get the common filename prefix for all files in this dataset, e.g. "iso8192" for the isotropic8192 dataset.
-            dataset_filename_prefix = get_filename_prefix(self.dataset_title)
+            dataset_filename_prefix = get_filename_prefix(dataset_title)
             
+            """
+            production filepaths.
+            """
+            # map the filepaths to the part of each filename that matches "ProductionDatabaseName" in the SQL metadata for this dataset.
+            tmp_filepaths = {}
+
             # recursively search all sub-directories in the turbulence fileDB system for the dataset zarr files.
-            turb_folders = self.get_turb_folders()
             filepaths = []
             for turb_folder in turb_folders:
                 # production metadata.
                 data_filepaths = glob.glob(turb_folder + dataset_filename_prefix + '*_prod/*.zarr')
-                
+
                 filepaths += data_filepaths
 
             # map the filepaths to the filenames so that they can be easily retrieved.
@@ -176,39 +244,25 @@ class iso_cube:
                 folderpath = os.sep.join(filepath_split[:-1]) + os.sep
                 filename = filepath.split(os.sep)[-1].split('_')[0].strip()
                 # only add the filepath to the dictionary once since there could be backup copies of the files.
-                if filename not in self.filepaths:
-                    self.filepaths[filename] = folderpath + filename
+                if filename not in tmp_filepaths:
+                    tmp_filepaths[filename] = folderpath + filename
+
+            # save tmp_filepaths to a pickled file.
+            with open(pickle_file_local, 'wb') as pickled_filepath:
+                dill.dump(tmp_filepaths, pickled_filepath)
             
-            # save self.filepaths to a pickled file.
-            with open(pickle_file, 'wb') as pickled_filepath:
-                dill.dump(self.filepaths, pickled_filepath)
-                
-        # backup metadata.
-        # -----
-        # pickled file for saving the backup globbed filepaths.
-        pickle_file = self.pickle_dir.joinpath(self.dataset_title + '_database_filepaths_backup.pickle')
-        
-        try:
-            if self.rewrite_metadata:
-                raise FileNotFoundError
-            
-            # try reading the pickled file.
-            with open(pickle_file, 'rb') as pickled_filepath:
-                self.filepaths_backup = dill.load(pickled_filepath)
-        except FileNotFoundError:
+            """
+            backup filepaths.
+            """
             # map the filepaths to the part of each filename that matches "ProductionDatabaseName" in the SQL metadata for this dataset.
-            self.filepaths_backup = {}
-            
-            # get the common filename prefix for all files in this dataset, e.g. "iso8192" for the isotropic8192 dataset.
-            dataset_filename_prefix = get_filename_prefix(self.dataset_title)
-            
+            tmp_filepaths_backup = {}
+
             # recursively search all sub-directories in the turbulence fileDB system for the dataset zarr files.
-            turb_folders = self.get_turb_folders()
             filepaths = []
             for turb_folder in turb_folders:
                 # backup metadata.
                 data_filepaths = glob.glob(turb_folder + dataset_filename_prefix + '*_back/*.zarr')
-                
+
                 filepaths += data_filepaths
 
             # map the filepaths to the filenames so that they can be easily retrieved.
@@ -218,181 +272,162 @@ class iso_cube:
                 folderpath = os.sep.join(filepath_split[:-1]) + os.sep
                 filename = filepath.split(os.sep)[-1].split('_')[0].strip()
                 # only add the filepath to the dictionary once since there could be backup copies of the files.
-                if filename not in self.filepaths_backup:
-                    self.filepaths_backup[filename] = folderpath + filename
-            
-            # save self.filepaths_backup to a pickled file.
-            with open(pickle_file, 'wb') as pickled_filepath:
-                dill.dump(self.filepaths_backup, pickled_filepath)
+                if filename not in tmp_filepaths_backup:
+                    tmp_filepaths_backup[filename] = folderpath + filename
+
+            # save tmp_filepaths_backup to a pickled file.
+            with open(pickle_file_local_backup, 'wb') as pickled_filepath:
+                dill.dump(tmp_filepaths_backup, pickled_filepath)
+                    
+        if read_metadata:
+            self.filepaths = self.read_pickle_file(pickle_filename)
+            self.filepaths_backup = self.read_pickle_file(pickle_filename_backup)
                 
-    def init_cornercode_file_map(self):
-        # production metadata.
-        # -----
-        # pickled file for saving the db file cornercodes to filenames map.
-        pickle_file = self.pickle_dir.joinpath(self.dataset_title + f'_cornercode_file_map.pickle')
+    def init_cornercode_file_map(self, dataset_title, N, read_metadata = False, rewrite_metadata = False):
+        """
+        pickled db file cornercodes to filenames map.
+        """
+        # pickled db file cornercodes to production filenames map.
+        pickle_filename = dataset_title + f'_cornercode_file_map.pickle'
+        pickle_file_prod = self.pickle_dir.joinpath(pickle_filename)
+        pickle_file_back = self.pickle_dir_backup.joinpath(pickle_filename)
+        pickle_file_local = self.pickle_dir_local.joinpath(pickle_filename)
         
-        try:
-            if self.rewrite_metadata:
-                raise FileNotFoundError
-            
-            # try reading the pickled file.
-            with open(pickle_file, 'rb') as pickled_file_map:
-                self.cornercode_file_map = dill.load(pickled_file_map)
-        except FileNotFoundError:
+        # check if the pickled file is accessible.
+        if not (pickle_file_prod.is_file() or pickle_file_back.is_file() or pickle_file_local.is_file()) or rewrite_metadata:
             # create a map of the db file cornercodes to filenames for the whole dataset.
-            self.cornercode_file_map = {}
-            
+            tmp_cornercode_file_map = {}
+
             cornercode = 0
-            while cornercode < self.N ** 3:
+            while cornercode < N ** 3:
                 # get the file info for the db file cornercode.
-                f, db_minLim, db_maxLim = self.get_file_for_mortoncode(cornercode, backup = False)
-                
-                self.cornercode_file_map[db_minLim] = f
-                
+                f, db_minLim, db_maxLim = self.get_file_for_mortoncode(cornercode)
+
+                tmp_cornercode_file_map[db_minLim] = f
+
                 cornercode = db_maxLim + 1
+
+            # save tmp_cornercode_file_map to a pickled file.
+            with open(pickle_file_local, 'wb') as pickled_file_map:
+                dill.dump(tmp_cornercode_file_map, pickled_file_map)
                 
-            # save self.cornercode_file_map to a pickled file.
-            with open(pickle_file, 'wb') as pickled_file_map:
-                dill.dump(self.cornercode_file_map, pickled_file_map)
-                
-        # backup metadata file.
-        # -----
-        # pickled file for saving the backup db file cornercodes to filenames map.
-        pickle_file = self.pickle_dir.joinpath(self.dataset_title + f'_cornercode_file_map_backup.pickle')
-        
-        try:
-            if self.rewrite_metadata:
-                raise FileNotFoundError
-            
-            # try reading the pickled file.
-            with open(pickle_file, 'rb') as pickled_file_map:
-                self.cornercode_file_map_backup = dill.load(pickled_file_map)
-        except FileNotFoundError:
-            # create a map of the db file cornercodes to filenames for the whole dataset.
-            self.cornercode_file_map_backup = {}
-            
-            cornercode = 0
-            while cornercode < self.N ** 3:
-                # get the file info for the db file cornercode.
-                f, db_minLim, db_maxLim = self.get_file_for_mortoncode(cornercode, backup = True)
-                
-                self.cornercode_file_map_backup[db_minLim] = f
-                
-                cornercode = db_maxLim + 1
-                
-            # save self.cornercode_file_map_backup to a pickled file.
-            with open(pickle_file, 'wb') as pickled_file_map:
-                dill.dump(self.cornercode_file_map_backup, pickled_file_map)
+        if read_metadata:
+            self.cornercode_file_map = self.read_pickle_file(pickle_filename)
     
-    def init_interpolation_lookup_table(self):
+    def init_interpolation_lookup_table(self, sint = 'none', read_metadata = False, rewrite_metadata = False):
+        """
+        pickled interpolation lookup table.
+        """
         # interpolation method 'none' is omitted because there is no lookup table for 'none' interpolation.
         interp_methods = ['lag4', 'm1q4', 'lag6', 'lag8', 'm2q8',
                           'fd4noint_g', 'fd6noint_g', 'fd8noint_g', 'fd4lag4_g', 'm1q4_g', 'm2q8_g',
                           'fd4noint_l', 'fd6noint_l', 'fd8noint_l', 'fd4lag4_l',
                           'fd4noint_h', 'fd6noint_h', 'fd8noint_h', 'm2q8_h']
         
-        # lookup table resolution.
-        self.NB = 10**5
-        
         # create the metadata files for each interpolation method if they do not already exist.
         for interp_method in interp_methods:
             # pickled file for saving the interpolation coefficient lookup table.
-            pickle_file = self.pickle_dir.joinpath(f'{interp_method}_lookup_table.pickle')
+            pickle_filename = f'{interp_method}_lookup_table.pickle'
+            pickle_file_prod = self.pickle_dir.joinpath(pickle_filename)
+            pickle_file_back = self.pickle_dir_backup.joinpath(pickle_filename)
+            pickle_file_local = self.pickle_dir_local.joinpath(pickle_filename)
 
-            # check if the pickled file exists.
-            if not pickle_file.is_file():
+            # check if the pickled file is accessible.
+            if not (pickle_file_prod.is_file() or pickle_file_back.is_file() or pickle_file_local.is_file()) or rewrite_metadata:
                 # create the interpolation coefficient lookup table.
-                tmp_LW = self.getLagL(interp_method)
+                tmp_lookup_table = self.createInterpolationLookupTable(interp_method)
 
-                # save self.LW to a pickled file.
-                with open(pickle_file, 'wb') as pickled_lookup_table:
-                    dill.dump(tmp_LW, pickled_lookup_table)
+                # save tmp_lookup_table to a pickled file.
+                with open(pickle_file_local, 'wb') as pickled_lookup_table:
+                    dill.dump(tmp_lookup_table, pickled_lookup_table)
         
-        # read in the interpolation lookup table for self.sint.
-        if self.sint != 'none':
-            # pickled file for saving the interpolation coefficient lookup table.
-            pickle_file = self.pickle_dir.joinpath(f'{self.sint}_lookup_table.pickle')
-
-            with open(pickle_file, 'rb') as pickled_lookup_table:
-                self.LW = dill.load(pickled_lookup_table)
+        # read in the interpolation lookup table for sint. the interpolation lookup tables are only read from
+        # the get_iso_points_variable and get_iso_points_variable_visitor functions.
+        if sint != 'none' and read_metadata:
+            # pickled interpolation coefficient lookup table.
+            self.lookup_table = self.read_pickle_file(f'{sint}_lookup_table.pickle')
+            
+            # read in the function interpolation lookup table that is used in the calculation of other interpolation methods.
+            if sint in ['fd4lag4_g', 'm1q4_g', 'm2q8_g',
+                        'fd4lag4_l',
+                        'm2q8_h']:
+                # convert sint to the needed function interpolation name.
+                sint_name = sint.split('_')[0].replace('fd4', '')
                 
-            # get interpolation LW for use in calcuating the gradient.
-            if self.sint in ['fd4lag4_g', 'm1q4_g', 'm2q8_g',
-                             'fd4lag4_l',
-                             'm2q8_h']:
-                # pickled file for saving the interpolation coefficient lookup table.
-                sint_name = self.sint.split('_')[0].replace('fd4', '')
-                
-                pickle_file = self.pickle_dir.joinpath(f'{sint_name}_lookup_table.pickle')
-
-                with open(pickle_file, 'rb') as pickled_lookup_table:
-                    self.interpolation_LW = dill.load(pickled_lookup_table)
+                # pickled interpolation coefficient lookup table.
+                self.function_lookup_table = self.read_pickle_file(f'{sint_name}_lookup_table.pickle')
                     
-                # pickled file for saving the gradient coefficient lookup table.
-                if self.sint == 'm2q8_h':
-                    sint_name = self.sint.replace('_h', '_g')
+                # read in the gradient coefficient lookup table that is used in the calculation of the m2q8 spline hessian.
+                if sint == 'm2q8_h':
+                    # convert sint to the needed gradient interpolation name.
+                    sint_name = sint.replace('_h', '_g')
                     
-                    pickle_file = self.pickle_dir.joinpath(f'{sint_name}_lookup_table.pickle')
-
-                    with open(pickle_file, 'rb') as pickled_lookup_table:
-                        self.gradient_LW = dill.load(pickled_lookup_table)
-            # get laplacian LW for use in calcuating the hessian.
-            elif self.sint in ['fd4noint_h', 'fd6noint_h', 'fd8noint_h']:
-                # pickled file for saving the interpolation coefficient lookup table.
-                sint_name = self.sint.replace('_h', '_l')
+                    # pickled gradient coefficient lookup table.
+                    self.gradient_lookup_table = self.read_pickle_file(f'{sint_name}_lookup_table.pickle')
+            # read in the laplacian interpolation lookup table that is used in the calculation of other interpolation methods.
+            elif sint in ['fd4noint_h', 'fd6noint_h', 'fd8noint_h']:
+                # convert sint to the needed gradient interpolation name.
+                sint_name = sint.replace('_h', '_l')
                 
-                pickle_file = self.pickle_dir.joinpath(f'{sint_name}_lookup_table.pickle')
-
-                with open(pickle_file, 'rb') as pickled_lookup_table:
-                    self.laplacian_LW = dill.load(pickled_lookup_table)
+                # pickled laplacian coefficient lookup table.
+                self.laplacian_lookup_table = self.read_pickle_file(f'{sint_name}_lookup_table.pickle')
                 
-    def init_interpolation_cube_size_lookup_table(self):
-        # pickled file for saving the interpolation cube sizes lookup table.
-        pickle_file = self.pickle_dir.joinpath(f'interpolation_cube_size_lookup_table.pickle')
+    def init_interpolation_cube_size_lookup_table(self, read_metadata = False, rewrite_metadata = False):
+        """
+        pickled interpolation cube sizes table.
+        """
+        # pickled interpolation cube sizes lookup table.
+        pickle_filename = 'interpolation_cube_size_lookup_table.pickle'
+        pickle_file_prod = self.pickle_dir.joinpath(pickle_filename)
+        pickle_file_back = self.pickle_dir_backup.joinpath(pickle_filename)
+        pickle_file_local = self.pickle_dir_local.joinpath(pickle_filename)
         
-        try:
-            # try reading the pickled file.
-            with open(pickle_file, 'rb') as pickled_lookup_table:
-                interp_cube_sizes = dill.load(pickled_lookup_table)
-        except FileNotFoundError:
+        # check if the pickled file is accessible.
+        if not (pickle_file_prod.is_file() or pickle_file_back.is_file() or pickle_file_local.is_file()) or rewrite_metadata:
             # create the interpolation cube size lookup table. the first number is the number of points on the left of the integer 
             # interpolation point, and the second number is the number of points on the right.
-            interp_cube_sizes = {}
-            interp_cube_sizes['lag4'] = [1, 2]
-            interp_cube_sizes['m1q4'] = [1, 2]
-            interp_cube_sizes['lag6'] = [2, 3]
-            interp_cube_sizes['lag8'] = [3, 4]
-            interp_cube_sizes['m2q8'] = [3, 4]
-            interp_cube_sizes['fd4noint_g'] = [2, 3]
-            interp_cube_sizes['fd6noint_g'] = [3, 4]
-            interp_cube_sizes['fd8noint_g'] = [4, 5]
-            interp_cube_sizes['m1q4_g'] = [1, 2]
-            interp_cube_sizes['m2q8_g'] = [3, 4]
-            interp_cube_sizes['fd4lag4_g'] = [3, 4]
-            interp_cube_sizes['fd4noint_l'] = [2, 3]
-            interp_cube_sizes['fd6noint_l'] = [3, 4]
-            interp_cube_sizes['fd8noint_l'] = [4, 5]
-            interp_cube_sizes['fd4lag4_l'] = [3, 4]
-            interp_cube_sizes['fd4noint_h'] = [2, 3]
-            interp_cube_sizes['fd6noint_h'] = [3, 4]
-            interp_cube_sizes['fd8noint_h'] = [4, 5]
-            interp_cube_sizes['m2q8_h'] = [3, 4]
-            interp_cube_sizes['none'] = [0, 1]
-            
+            tmp_interp_cube_sizes = {}
+            tmp_interp_cube_sizes['lag4'] = [1, 2]
+            tmp_interp_cube_sizes['m1q4'] = [1, 2]
+            tmp_interp_cube_sizes['lag6'] = [2, 3]
+            tmp_interp_cube_sizes['lag8'] = [3, 4]
+            tmp_interp_cube_sizes['m2q8'] = [3, 4]
+            tmp_interp_cube_sizes['fd4noint_g'] = [2, 3]
+            tmp_interp_cube_sizes['fd6noint_g'] = [3, 4]
+            tmp_interp_cube_sizes['fd8noint_g'] = [4, 5]
+            tmp_interp_cube_sizes['m1q4_g'] = [1, 2]
+            tmp_interp_cube_sizes['m2q8_g'] = [3, 4]
+            tmp_interp_cube_sizes['fd4lag4_g'] = [3, 4]
+            tmp_interp_cube_sizes['fd4noint_l'] = [2, 3]
+            tmp_interp_cube_sizes['fd6noint_l'] = [3, 4]
+            tmp_interp_cube_sizes['fd8noint_l'] = [4, 5]
+            tmp_interp_cube_sizes['fd4lag4_l'] = [3, 4]
+            tmp_interp_cube_sizes['fd4noint_h'] = [2, 3]
+            tmp_interp_cube_sizes['fd6noint_h'] = [3, 4]
+            tmp_interp_cube_sizes['fd8noint_h'] = [4, 5]
+            tmp_interp_cube_sizes['m2q8_h'] = [3, 4]
+            tmp_interp_cube_sizes['none'] = [0, 1]
+
             # save interp_cube_sizes to a pickled file.
-            with open(pickle_file, 'wb') as pickled_lookup_table:
-                dill.dump(interp_cube_sizes, pickled_lookup_table)
-                
-        # lookup the interpolation cube size indices.
-        self.cube_min_index, self.cube_max_index = interp_cube_sizes[self.sint]
+            with open(pickle_file_local, 'wb') as pickled_lookup_table:
+                dill.dump(tmp_interp_cube_sizes, pickled_lookup_table)
+            
+        # the interpolation cube size indices are only read when called from the init_constants function.
+        if read_metadata:
+            interp_cube_sizes = self.read_pickle_file(pickle_filename)
+
+            # lookup the interpolation cube size indices.
+            self.cube_min_index, self.cube_max_index = interp_cube_sizes[self.sint]
     
-    def init_constants(self, var, var_original, timepoint, sint, num_values_per_datapoint, c,
-                       rewrite_metadata = False):
-        # create the constants.
+    def init_constants(self, var, var_original, timepoint, sint, tint, num_values_per_datapoint, c):
+        """
+        initialize the constants.
+        """
         self.var = var
         self.var_name = var_original
         self.timepoint = timepoint
         self.sint = sint
+        self.tint = tint
         self.num_values_per_datapoint = num_values_per_datapoint
         self.bytes_per_datapoint = c['bytes_per_datapoint']
         self.voxel_side_length = c['voxel_side_length']
@@ -402,47 +437,69 @@ class iso_cube:
         self.decimals = c['decimals']
         self.chunk_size = c['chunk_size']
         self.file_size = c['file_size']
-        self.rewrite_metadata = rewrite_metadata
+        
+        # set the byte order for reading the data from the files.
+        self.dt = np.dtype(np.float32)
+        self.dt = self.dt.newbyteorder('<')
         
         # get the number of digits in the timepoint part of the filenames, in order to add leading zeros.
         self.timepoint_digits = get_timepoint_digits(self.dataset_title)
         
+        # retrieve the list of datasets which use time indices.
+        time_index_datasets = get_time_index_datasets()
+        
         # set the dataset name to be used in the hdf5 file. 1 is added to timepoint because the original timepoint was converted to a 0-based index.
-        self.dataset_name = get_output_variable_name(var_original) + '_' + str(timepoint + 1).zfill(4)
+        dataset_name_timepoint = timepoint
+        if self.dataset_title in time_index_datasets:
+            dataset_name_timepoint = str(dataset_name_timepoint + 1).zfill(4)
+        else:
+            dataset_name_timepoint = str(dataset_name_timepoint)
         
-        # get map of the filepaths for all of the dataset files.
-        self.init_filepaths()
+        self.dataset_name = get_output_variable_name(var_original) + '_' + dataset_name_timepoint
         
-        # get a map of the files to cornercodes for all of the dataset files.
-        self.init_cornercode_file_map()
+        # retrieve the list of datasets processed by the giverny code.
+        giverny_datasets = get_giverny_datasets()
+        
+        # initialize the interpolation cube size lookup table.
+        if self.dataset_title in giverny_datasets:
+            self.init_interpolation_cube_size_lookup_table(read_metadata = True)
+        
+            # variables needed to open the zarr file for reading. variables are put together for easier passing into the dask worker functions.
+            self.open_file_vars = [self.var_name, self.timepoint, self.timepoint_digits, self.dt]
+
+            # interpolate function variables.
+            self.interpolate_vars = [self.cube_min_index, self.cube_max_index, self.sint, self.lookup_N, self.dx]
+
+            # getCutout variables.
+            self.getcutout_vars = [self.file_size]
+
+            # getVariable variables.
+            self.getvariable_vars = [self.dataset_title, self.num_values_per_datapoint, self.N, self.chunk_size, self.file_size]
     
     """
     interpolation functions.
     """
-    def getLagL(self, sint):
+    def createInterpolationLookupTable(self, sint):
+        """
+        generate interpolation lookup table.
+        """
         if sint in ['fd4noint_g', 'fd6noint_g', 'fd8noint_g',
                     'fd4noint_l', 'fd6noint_l', 'fd8noint_l',
                     'fd4noint_h', 'fd6noint_h', 'fd8noint_h']:
-            LW = self.getLagC(sint)
+            lookup_table = self.getInterpolationCoefficients(sint)
         else:
-            LW = []
+            lookup_table = []
             
-            frac = np.linspace(0, 1 - 1 / self.NB, self.NB)
+            frac = np.linspace(0, 1 - 1 / self.lookup_N, self.lookup_N)
             for fp in frac:
-                LW.append(self.getLagC(sint, fp))
+                lookup_table.append(self.getInterpolationCoefficients(sint, fp))
 
-        return LW
+        return lookup_table
     
-    #===============================================================================
-    # Interpolating functions to compute the kernel, extract subcube and convolve
-    #===============================================================================
-    def getLagC(self, sint, fr = 0.0):
-        #------------------------------------------------------
-        # get the 1D vectors for the 8 point Lagrange weights
-        # inline the constants, and write explicit for loop
-        # for the C compilation
-        #------------------------------------------------------
-        # cdef int n.
+    def getInterpolationCoefficients(self, sint, fr = 0.0):
+        """
+        get interpolation coefficients.
+        """
         if sint == 'fd4noint_h':
             g = np.array([-1.0 / 48.0 / self.dx / self.dx,
                           1.0 / 48.0 / self.dx / self.dx,
@@ -543,9 +600,7 @@ class iso_cube:
         elif sint in ['fd4lag4_g', 'fd4lag4_l']:
             wN = [1.,-3.,3.,-1.]
             B  = np.array([0,1.,0,0])
-            #----------------------------
-            # calculate weights if fr>0, and insert into gg
-            #----------------------------
+            # calculate weights if fr>0, and insert into g.
             if (fr>0):
                 s = 0
                 for n in range(4):
@@ -593,14 +648,14 @@ class iso_cube:
             g[6] = fr * (fr * (fr * ((115.0 / 72.0) * fr - 3) + 49.0 / 40.0) + 1.0 / 90.0) + 1.0 / 60.0
             g[7] = fr**2 * (fr * (-2.0 / 9.0 * fr + 19.0 / 45.0) - 11.0 / 60.0)
         elif sint == 'm1q4':
-            # define the weights for M1Q4 spline interpolation.
+            # define the weights for m1q4 spline interpolation.
             g = np.zeros(4)
             g[0] = fr * (fr * (-1.0 / 2.0 * fr + 1) - 1.0 / 2.0)
             g[1] = fr**2 * ((3.0 / 2.0) * fr - 5.0 / 2.0) + 1
             g[2] = fr * (fr * (-3.0 / 2.0 * fr + 2) + 1.0 / 2.0)
             g[3] = fr**2 * ((1.0 / 2.0) * fr - 1.0 / 2.0)
         elif sint == 'm2q8':
-            # define the weights for M2Q8 spline interpolation.
+            # define the weights for m2q8 spline interpolation.
             g = np.zeros(8)  
             g[0] = fr * (fr * (fr * (fr * ((2.0 / 45.0) * fr - 7.0 / 60.0) + 1.0 / 12.0) + 1.0 / 180.0) - 1.0 / 60.0)
             g[1] = fr * (fr * (fr * (fr * (-23.0 / 72.0 * fr + 61.0 / 72.0) - 217.0 / 360.0) - 3.0 / 40.0) + 3.0 / 20.0)
@@ -628,9 +683,7 @@ class iso_cube:
                 # weight index.
                 w_index = 3
 
-            #----------------------------
-            # calculate weights if fr>0, and insert into gg
-            #----------------------------
+            # calculate weights if fr>0, and insert into g.
             if (fr>0):
                 num_points = len(g)
 
@@ -644,37 +697,83 @@ class iso_cube:
 
         return g
     
-    def interpLagL(self, p, u):
-        #--------------------------------------------------------
-        # p is an np.array(3) containing the three coordinates
-        #---------------------------------------------------------
-        # get the coefficients
-        #----------------------
-        if self.sint in ['fd4noint_h', 'fd6noint_h', 'fd8noint_h']:
+    def interpolate(self, p, u, interpolate_vars):
+        """
+        interpolating functions to compute the kernel, extract subcube and convolve.
+        
+        vars:
+         - p is an np.array(3) containing the three coordinates.
+        """
+        # assign the local variables.
+        cube_min_index, cube_max_index, sint, lookup_N, dx = interpolate_vars
+        
+        if sint in ['lag4', 'm1q4', 'lag6', 'lag8', 'm2q8']:
+            # function interpolations.
+            ix = p.astype(np.int32)
+            fr = p - ix
+            
+            # get the coefficients.
+            gx = self.lookup_table[int(lookup_N * fr[0])]
+            gy = self.lookup_table[int(lookup_N * fr[1])]
+            gz = self.lookup_table[int(lookup_N * fr[2])]
+            
+            # create the 3D kernel from the outer product of the 1d kernels.
+            gk = np.einsum('i,j,k', gz, gy, gx)
+
+            return np.einsum('ijk,ijkl->l', gk, u)
+        elif sint == 'none':
+            # 'none' function interpolation.
+            ix = np.floor(p + 0.5).astype(np.int32)
+            
+            return np.array(u[ix[2], ix[1], ix[0], :])
+        elif sint in ['fd4noint_g', 'fd6noint_g', 'fd8noint_g',
+                      'fd4noint_l', 'fd6noint_l', 'fd8noint_l']:
+            # gradient and laplacian finite differences.
             ix = np.floor(p + 0.5).astype(int)
-            CenteredFiniteDiffCoeff_dia = self.laplacian_LW
-            CenteredFiniteDiffCoeff_offdia = self.LW
-            #---------------------------------------
-            # assemble the 5x5x5 cube and convolve
-            #---------------------------------------
-            # diagnoal components
-            component_x = u[ix[2], ix[1], ix[0] - self.cube_min_index : ix[0] + self.cube_max_index, :]
-            component_y = u[ix[2], ix[1] - self.cube_min_index : ix[1] + self.cube_max_index, ix[0], :]
-            component_z = u[ix[2] - self.cube_min_index : ix[2] + self.cube_max_index, ix[1], ix[0], :]
+            # diagonal coefficients.
+            fd_coeff = self.lookup_table
+            
+            # diagnoal components.
+            component_x = u[ix[2], ix[1], ix[0] - cube_min_index : ix[0] + cube_max_index, :]
+            component_y = u[ix[2], ix[1] - cube_min_index : ix[1] + cube_max_index, ix[0], :]
+            component_z = u[ix[2] - cube_min_index : ix[2] + cube_max_index, ix[1], ix[0], :]
 
-            uii = np.inner(CenteredFiniteDiffCoeff_dia,component_x.T)  
-            ujj = np.inner(CenteredFiniteDiffCoeff_dia,component_y.T)
-            ukk = np.inner(CenteredFiniteDiffCoeff_dia,component_z.T)
+            dvdx = np.inner(fd_coeff, component_x.T)  
+            dvdy = np.inner(fd_coeff, component_y.T)
+            dvdz = np.inner(fd_coeff, component_z.T)
+            
+            # return gradient values.
+            if '_g' in sint:
+                return np.stack((dvdx, dvdy, dvdz), axis = 1).flatten()
+            # return laplacian values.
+            elif '_l' in sint:
+                return dvdx + dvdy + dvdz
+        elif sint in ['fd4noint_h', 'fd6noint_h', 'fd8noint_h']:
+            # hessian finite differences.
+            ix = np.floor(p + 0.5).astype(int)
+            # diagonal coefficients.
+            fd_coeff_l = self.laplacian_lookup_table
+            # off-diagonal coefficients.
+            fd_coeff_h = self.lookup_table
+            
+            # diagnoal components.
+            component_x = u[ix[2], ix[1], ix[0] - cube_min_index : ix[0] + cube_max_index, :]
+            component_y = u[ix[2], ix[1] - cube_min_index : ix[1] + cube_max_index, ix[0], :]
+            component_z = u[ix[2] - cube_min_index : ix[2] + cube_max_index, ix[1], ix[0], :]
 
-            # off-diagnoal components.
-            if self.sint == 'fd4noint_h':
+            uii = np.inner(fd_coeff_l, component_x.T)  
+            ujj = np.inner(fd_coeff_l, component_y.T)
+            ukk = np.inner(fd_coeff_l, component_z.T)
+
+            # off-diagonal components.
+            if sint == 'fd4noint_h':
                 component_xy = np.array([u[ix[2],ix[1]+2,ix[0]+2,:],u[ix[2],ix[1]-2,ix[0]+2,:],u[ix[2],ix[1]-2,ix[0]-2,:],u[ix[2],ix[1]+2,ix[0]-2,:],
                                          u[ix[2],ix[1]+1,ix[0]+1,:],u[ix[2],ix[1]-1,ix[0]+1,:],u[ix[2],ix[1]-1,ix[0]-1,:],u[ix[2],ix[1]+1,ix[0]-1,:]])
                 component_xz = np.array([u[ix[2]+2,ix[1],ix[0]+2,:],u[ix[2]-2,ix[1],ix[0]+2,:],u[ix[2]-2,ix[1],ix[0]-2,:],u[ix[2]+2,ix[1],ix[0]-2,:],
                                          u[ix[2]+1,ix[1],ix[0]+1,:],u[ix[2]-1,ix[1],ix[0]+1,:],u[ix[2]-1,ix[1],ix[0]-1,:],u[ix[2]+1,ix[1],ix[0]-1,:]])
                 component_yz = np.array([u[ix[2]+2,ix[1]+2,ix[0],:],u[ix[2]-2,ix[1]+2,ix[0],:],u[ix[2]-2,ix[1]-2,ix[0],:],u[ix[2]+2,ix[1]-2,ix[0],:],
                                          u[ix[2]+1,ix[1]+1,ix[0],:],u[ix[2]-1,ix[1]+1,ix[0],:],u[ix[2]-1,ix[1]-1,ix[0],:],u[ix[2]+1,ix[1]-1,ix[0],:]])
-            elif self.sint == 'fd6noint_h':
+            elif sint == 'fd6noint_h':
                 component_xy = np.array([u[ix[2],ix[1]+3,ix[0]+3,:],u[ix[2],ix[1]-3,ix[0]+3,:],u[ix[2],ix[1]-3,ix[0]-3,:],u[ix[2],ix[1]+3,ix[0]-3,:],
                                          u[ix[2],ix[1]+2,ix[0]+2,:],u[ix[2],ix[1]-2,ix[0]+2,:],u[ix[2],ix[1]-2,ix[0]-2,:],u[ix[2],ix[1]+2,ix[0]-2,:],
                                          u[ix[2],ix[1]+1,ix[0]+1,:],u[ix[2],ix[1]-1,ix[0]+1,:],u[ix[2],ix[1]-1,ix[0]-1,:],u[ix[2],ix[1]+1,ix[0]-1,:]])
@@ -684,7 +783,7 @@ class iso_cube:
                 component_yz = np.array([u[ix[2]+3,ix[1]+3,ix[0],:],u[ix[2]-3,ix[1]+3,ix[0],:],u[ix[2]-3,ix[1]-3,ix[0],:],u[ix[2]+3,ix[1]-3,ix[0],:],
                                          u[ix[2]+2,ix[1]+2,ix[0],:],u[ix[2]-2,ix[1]+2,ix[0],:],u[ix[2]-2,ix[1]-2,ix[0],:],u[ix[2]+2,ix[1]-2,ix[0],:],
                                          u[ix[2]+1,ix[1]+1,ix[0],:],u[ix[2]-1,ix[1]+1,ix[0],:],u[ix[2]-1,ix[1]-1,ix[0],:],u[ix[2]+1,ix[1]-1,ix[0],:]])
-            elif self.sint == 'fd8noint_h':
+            elif sint == 'fd8noint_h':
                 component_xy = np.array([u[ix[2],ix[1]+4,ix[0]+4,:],u[ix[2],ix[1]-4,ix[0]+4,:],u[ix[2],ix[1]-4,ix[0]-4,:],u[ix[2],ix[1]+4,ix[0]-4,:],
                                          u[ix[2],ix[1]+3,ix[0]+3,:],u[ix[2],ix[1]-3,ix[0]+3,:],u[ix[2],ix[1]-3,ix[0]-3,:],u[ix[2],ix[1]+3,ix[0]-3,:],
                                          u[ix[2],ix[1]+2,ix[0]+2,:],u[ix[2],ix[1]-2,ix[0]+2,:],u[ix[2],ix[1]-2,ix[0]-2,:],u[ix[2],ix[1]+2,ix[0]-2,:],
@@ -697,49 +796,62 @@ class iso_cube:
                                          u[ix[2]+3,ix[1]+3,ix[0],:],u[ix[2]-3,ix[1]+3,ix[0],:],u[ix[2]-3,ix[1]-3,ix[0],:],u[ix[2]+3,ix[1]-3,ix[0],:],
                                          u[ix[2]+2,ix[1]+2,ix[0],:],u[ix[2]-2,ix[1]+2,ix[0],:],u[ix[2]-2,ix[1]-2,ix[0],:],u[ix[2]+2,ix[1]-2,ix[0],:],
                                          u[ix[2]+1,ix[1]+1,ix[0],:],u[ix[2]-1,ix[1]+1,ix[0],:],u[ix[2]-1,ix[1]-1,ix[0],:],u[ix[2]+1,ix[1]-1,ix[0],:]])
-
-            uij = np.inner(CenteredFiniteDiffCoeff_offdia,component_xy.T) 
-            uik = np.inner(CenteredFiniteDiffCoeff_offdia,component_xz.T) 
-            ujk = np.inner(CenteredFiniteDiffCoeff_offdia,component_yz.T)
             
-            return np.array([uii,uij,uik,ujj,ujk,ukk]) 
-        elif self.sint in ['fd4noint_g', 'fd6noint_g', 'fd8noint_g',
-                           'fd4noint_l', 'fd6noint_l', 'fd8noint_l']:
-            ix = np.floor(p + 0.5).astype(int)
-            CenteredFiniteDiffCoeff = self.LW
-            #---------------------------------------
-            # assemble the 5x5x5 cube and convolve
-            #---------------------------------------
-            # diagnoal components
-            component_x = u[ix[2], ix[1], ix[0] - self.cube_min_index : ix[0] + self.cube_max_index, :]
-            component_y = u[ix[2], ix[1] - self.cube_min_index : ix[1] + self.cube_max_index, ix[0], :]
-            component_z = u[ix[2] - self.cube_min_index : ix[2] + self.cube_max_index, ix[1], ix[0], :]
-
-            dvdx = np.inner(CenteredFiniteDiffCoeff,component_x.T)  
-            dvdy = np.inner(CenteredFiniteDiffCoeff,component_y.T)
-            dvdz = np.inner(CenteredFiniteDiffCoeff,component_z.T)
+            uij = np.inner(fd_coeff_h, component_xy.T) 
+            uik = np.inner(fd_coeff_h, component_xz.T) 
+            ujk = np.inner(fd_coeff_h, component_yz.T)
             
-            # return gradient values.
-            if '_g' in self.sint:
-                return np.stack((dvdx, dvdy, dvdz), axis = 1)
-            # return laplacian values.
-            elif '_l' in self.sint:
-                return dvdx + dvdy + dvdz
-        elif self.sint == 'm2q8_h':
+            return np.stack((uii,uij,uik,ujj,ujk,ukk), axis = 1).flatten()
+        elif sint in ['m1q4_g', 'm2q8_g']:
+            # gradient spline differentiations.
+            ix = p.astype(int) 
+            fr = p - ix
+            
+            # function spline coefficients.
+            gx = self.function_lookup_table[int(lookup_N * fr[0])]
+            gy = self.function_lookup_table[int(lookup_N * fr[1])]
+            gz = self.function_lookup_table[int(lookup_N * fr[2])]
+            
+            # gradient spline coefficients.
+            gx_G = self.lookup_table[int(lookup_N * fr[0])]
+            gy_G = self.lookup_table[int(lookup_N * fr[1])]
+            gz_G = self.lookup_table[int(lookup_N * fr[2])]
+            
+            gk_x = np.einsum('i,j,k', gz, gy, gx_G)
+            gk_y = np.einsum('i,j,k', gz, gy_G, gx)
+            gk_z = np.einsum('i,j,k', gz_G, gy, gx)
+            
+            d = u[ix[2] - cube_min_index : ix[2] + cube_max_index + 1,
+                  ix[1] - cube_min_index : ix[1] + cube_max_index + 1,
+                  ix[0] - cube_min_index : ix[0] + cube_max_index + 1, :] / dx
+            
+            # dudx,dvdx,dwdx.
+            dvdx = np.einsum('ijk,ijkl->l', gk_x, d)
+            # dudy,dvdy,dwdy.
+            dvdy = np.einsum('ijk,ijkl->l', gk_y, d)
+            # dudz,dvdz,dwdz.
+            dvdz = np.einsum('ijk,ijkl->l', gk_z, d)
+            
+            return np.stack((dvdx, dvdy, dvdz), axis = 1).flatten()
+        elif sint == 'm2q8_h':
+            # hessian spline differentiation.
             ix = p.astype('int')
             fr = p - ix
             
-            gx = self.interpolation_LW[int(self.NB * fr[0])]
-            gy = self.interpolation_LW[int(self.NB * fr[1])]
-            gz = self.interpolation_LW[int(self.NB * fr[2])]
+            # function spline coefficients.
+            gx = self.function_lookup_table[int(lookup_N * fr[0])]
+            gy = self.function_lookup_table[int(lookup_N * fr[1])]
+            gz = self.function_lookup_table[int(lookup_N * fr[2])]
             
-            gx_G = self.gradient_LW[int(self.NB * fr[0])]
-            gy_G = self.gradient_LW[int(self.NB * fr[1])]
-            gz_G = self.gradient_LW[int(self.NB * fr[2])]
+            # gradient spline coefficients.
+            gx_G = self.gradient_lookup_table[int(lookup_N * fr[0])]
+            gy_G = self.gradient_lookup_table[int(lookup_N * fr[1])]
+            gz_G = self.gradient_lookup_table[int(lookup_N * fr[2])]
             
-            gx_GG = self.LW[int(self.NB * fr[0])]
-            gy_GG = self.LW[int(self.NB * fr[1])]
-            gz_GG = self.LW[int(self.NB * fr[2])]
+            # hessian spline coefficients.
+            gx_GG = self.lookup_table[int(lookup_N * fr[0])]
+            gy_GG = self.lookup_table[int(lookup_N * fr[1])]
+            gz_GG = self.lookup_table[int(lookup_N * fr[2])]
 
             gk_xx = np.einsum('i,j,k', gz, gy, gx_GG)
             gk_yy = np.einsum('i,j,k', gz, gy_GG, gx)
@@ -748,9 +860,9 @@ class iso_cube:
             gk_xz = np.einsum('i,j,k', gz_G, gy, gx_G)
             gk_yz = np.einsum('i,j,k', gz_G, gy_G, gx)     
 
-            d = u[ix[2] - self.cube_min_index : ix[2] + self.cube_max_index + 1,
-                  ix[1] - self.cube_min_index : ix[1] + self.cube_max_index + 1,
-                  ix[0] - self.cube_min_index : ix[0] + self.cube_max_index + 1, :] / self.dx / self.dx
+            d = u[ix[2] - cube_min_index : ix[2] + cube_max_index + 1,
+                  ix[1] - cube_min_index : ix[1] + cube_max_index + 1,
+                  ix[0] - cube_min_index : ix[0] + cube_max_index + 1, :] / dx / dx
 
             uii = np.einsum('ijk,ijkl->l', gk_xx, d)
             ujj = np.einsum('ijk,ijkl->l', gk_yy, d)
@@ -759,127 +871,105 @@ class iso_cube:
             uik = np.einsum('ijk,ijkl->l', gk_xz, d)
             ujk = np.einsum('ijk,ijkl->l', gk_yz, d)                              
 
-            return np.stack((uii,uij,uik,ujj,ujk,ukk), axis = 1)
-        elif self.sint in ['m1q4_g', 'm2q8_g']:
-            ix = p.astype(int) 
-            fr = p - ix
-            
-            gx = self.interpolation_LW[int(self.NB * fr[0])]
-            gy = self.interpolation_LW[int(self.NB * fr[1])]
-            gz = self.interpolation_LW[int(self.NB * fr[2])]
-            
-            gx_G = self.LW[int(self.NB * fr[0])]
-            gy_G = self.LW[int(self.NB * fr[1])]
-            gz_G = self.LW[int(self.NB * fr[2])]
-            
-            gk_x = np.einsum('i,j,k', gz, gy, gx_G)
-            gk_y = np.einsum('i,j,k', gz, gy_G, gx)
-            gk_z = np.einsum('i,j,k', gz_G, gy, gx)
-            
-            d = u[ix[2] - self.cube_min_index : ix[2] + self.cube_max_index + 1,
-                  ix[1] - self.cube_min_index : ix[1] + self.cube_max_index + 1,
-                  ix[0] - self.cube_min_index : ix[0] + self.cube_max_index + 1, :] / self.dx
-            
-            dvdx = np.einsum('ijk,ijkl->l',gk_x, d) #dudx,dvdx,dwdx
-            dvdy = np.einsum('ijk,ijkl->l',gk_y, d) #dudy,dvdy,dwdy
-            dvdz = np.einsum('ijk,ijkl->l',gk_z, d) #dudz,dvdz,dwdz
-            
-            return np.stack((dvdx, dvdy, dvdz), axis = 1)
-        elif self.sint == 'fd4lag4_l':
-            ix = p.astype(int)   
-            fr = p - ix
-            
-            gx = self.interpolation_LW[int(self.NB * fr[0])]
-            gy = self.interpolation_LW[int(self.NB * fr[1])]
-            gz = self.interpolation_LW[int(self.NB * fr[2])]
-            
-            gx_L = self.LW[int(self.NB * fr[0])]
-            gy_L = self.LW[int(self.NB * fr[1])]
-            gz_L = self.LW[int(self.NB * fr[2])]
-
-            gk_x = np.einsum('i,j,k', gz, gy, gx_L)
-            gk_y = np.einsum('i,j,k', gz, gy_L, gx)
-            gk_z = np.einsum('i,j,k', gz_L, gy, gx)
-
-            d_x = u[ix[2] - 1 : ix[2] + 3, ix[1] - 1 : ix[1] + 3, ix[0] - 3 : ix[0] + 5, :]            
-            d_y = u[ix[2] - 1 : ix[2] + 3, ix[1] - 3 : ix[1] + 5, ix[0] - 1 : ix[0] + 3, :]
-            d_z = u[ix[2] - 3 : ix[2] + 5, ix[1] - 1 : ix[1] + 3, ix[0] - 1 : ix[0] + 3, :]
-
-            dvdx = np.einsum('ijk,ijkl->l', gk_x, d_x) #dudxx,dvdxx,dwdxx
-            dvdy = np.einsum('ijk,ijkl->l', gk_y, d_y) #dudyy,dvdyy,dwdyy
-            dvdz = np.einsum('ijk,ijkl->l', gk_z, d_z) #dudzz,dvdzz,dwdzz                            
-
-            dudxyz = dvdx[0] + dvdy[0] + dvdz[0]
-            dvdxyz = dvdx[1] + dvdy[1] + dvdz[1]
-            dwdxyz = dvdx[2] + dvdy[2] + dvdz[2]
-
-            return np.array([dudxyz, dvdxyz, dwdxyz])
-        elif self.sint == 'fd4lag4_g':
+            return np.stack((uii,uij,uik,ujj,ujk,ukk), axis = 1).flatten()
+        elif sint in ['fd4lag4_g', 'fd4lag4_l']:
+            # gradient and laplacian finite difference with function interpolation.
             ix = p.astype(int) 
             fr = p - ix      
             
-            gx = self.interpolation_LW[int(self.NB * fr[0])]
-            gy = self.interpolation_LW[int(self.NB * fr[1])]
-            gz = self.interpolation_LW[int(self.NB * fr[2])]
+            # function interpolation coefficients.
+            gx = self.function_lookup_table[int(lookup_N * fr[0])]
+            gy = self.function_lookup_table[int(lookup_N * fr[1])]
+            gz = self.function_lookup_table[int(lookup_N * fr[2])]
             
-            gx_G = self.LW[int(self.NB * fr[0])]
-            gy_G = self.LW[int(self.NB * fr[1])]
-            gz_G = self.LW[int(self.NB * fr[2])]
+            # finite difference coefficients.
+            gx_F = self.lookup_table[int(lookup_N * fr[0])]
+            gy_F = self.lookup_table[int(lookup_N * fr[1])]
+            gz_F = self.lookup_table[int(lookup_N * fr[2])]
             
-            gk_x = np.einsum('i,j,k', gz, gy, gx_G)           
-            gk_y = np.einsum('i,j,k', gz, gy_G, gx)           
-            gk_z = np.einsum('i,j,k', gz_G, gy, gx)
+            gk_x = np.einsum('i,j,k', gz, gy, gx_F)           
+            gk_y = np.einsum('i,j,k', gz, gy_F, gx)           
+            gk_z = np.einsum('i,j,k', gz_F, gy, gx)
 
             d_x = u[ix[2] - 1 : ix[2] + 3, ix[1] - 1 : ix[1] + 3, ix[0] - 3 : ix[0] + 5, :]           
             d_y = u[ix[2] - 1 : ix[2] + 3, ix[1] - 3 : ix[1] + 5, ix[0] - 1 : ix[0] + 3, :]           
             d_z = u[ix[2] - 3 : ix[2] + 5, ix[1] - 1 : ix[1] + 3, ix[0] - 1 : ix[0] + 3, :]
             
-            dvdx = np.einsum('ijk,ijkl->l', gk_x, d_x) #dudx,dvdx,dwdx           
-            dvdy = np.einsum('ijk,ijkl->l', gk_y, d_y) #dudy,dvdy,dwdy           
-            dvdz = np.einsum('ijk,ijkl->l', gk_z, d_z) #dudz,dvdz,dwdz
+            # dudx,dvdx,dwdx.
+            dvdx = np.einsum('ijk,ijkl->l', gk_x, d_x)
+            # dudy,dvdy,dwdy.
+            dvdy = np.einsum('ijk,ijkl->l', gk_y, d_y)
+            # dudz,dvdz,dwdz.
+            dvdz = np.einsum('ijk,ijkl->l', gk_z, d_z)
             
-            return np.stack((dvdx, dvdy, dvdz), axis = 1)
-        elif self.sint in ['lag4', 'm1q4', 'lag6', 'lag8', 'm2q8']:
-            # spatial interpolation methods.
-            ix = p.astype(np.int32)
-            fr = p - ix
-            gx = self.LW[int(self.NB * fr[0])]
-            gy = self.LW[int(self.NB * fr[1])]
-            gz = self.LW[int(self.NB * fr[2])]
-            #------------------------------------
-            # create the 3D kernel from the
-            # outer product of the 1d kernels
-            #------------------------------------
-            gk = np.einsum('i,j,k', gz, gy, gx)
+            if sint == 'fd4lag4_g':
+                return np.stack((dvdx, dvdy, dvdz), axis = 1).flatten()
+            elif sint == 'fd4lag4_l':
+                dudxyz = dvdx[0] + dvdy[0] + dvdz[0]
+                dvdxyz = dvdx[1] + dvdy[1] + dvdz[1]
+                dwdxyz = dvdx[2] + dvdy[2] + dvdz[2]
 
-            return np.einsum('ijk,ijkl->l', gk, u)
-        else:
-            # 'none' spatial interpolation.
-            ix = np.floor(p + 0.5).astype(np.int32)
-            
-            return np.array(u[ix[2], ix[1], ix[0], :])
+                return np.array([dudxyz, dvdxyz, dwdxyz])
         
     """
     common functions.
     """
-    def get_file_for_mortoncode(self, cornercode, backup = False):
+    def read_pickle_file(self, pickle_filename):
+        """
+        read the pickle metadata file. first, try reading from the production copy. second, try reading from the backup copy.
+        """
+        try:
+            # pickled file production filepath.
+            pickle_file = self.pickle_dir.joinpath(pickle_filename)
+        
+            # try reading the pickled file.
+            with open(pickle_file, 'rb') as pickled_filepath:
+                return dill.load(pickled_filepath)
+        except:
+            try:
+                # pickled file backup filepath.
+                pickle_file = self.pickle_dir_backup.joinpath(pickle_filename)
+
+                # try reading the pickled file.
+                with open(pickle_file, 'rb') as pickled_filepath:
+                    return dill.load(pickled_filepath)
+            except:
+                try:
+                    # pickled file backup filepath.
+                    pickle_file = self.pickle_dir_local.joinpath(pickle_filename)
+
+                    # try reading the pickled file.
+                    with open(pickle_file, 'rb') as pickled_filepath:
+                        return dill.load(pickled_filepath)
+                except:
+                    raise Exception('metadata files are not accessible.')
+    
+    def get_file_for_mortoncode(self, cornercode):
         """
         querying the cached SQL metadata for the file for the specified morton code.
         """
         # query the cached SQL metadata for the user-specified grid point.
         t = self.cache[(self.cache['minLim'] <= cornercode) & (self.cache['maxLim'] >= cornercode)]
         t = t.iloc[0]
-        if not backup:
-            try:
-                f = self.filepaths[f'{t.ProductionDatabaseName}']
-            except:
-                f = ''
-        else:
-            if self.dataset_title != 'sabl2048b' or self.dataset_title != 'sabl2048a':
-                f = self.filepaths_backup[f'{t.ProductionDatabaseName}']
-            else:
-                f = ''
+        f = self.filepaths[f'{t.ProductionDatabaseName}']
         return f, t.minLim, t.maxLim
+    
+    def open_zarr_file(self, db_file, db_file_backup, open_file_vars):
+        """
+        open the zarr file for reading. first, try reading from the production copy. second, try reading from the backup copy.
+        """
+        # assign the local variables.
+        var_name, timepoint, timepoint_digits, dt = open_file_vars
+        
+        try:
+            # try reading from the production file.
+            return zarr.open(f'{db_file}_{str(timepoint).zfill(timepoint_digits)}.zarr{os.sep}{var_name}', dtype = dt, mode = 'r')
+        except:
+            try:
+                # try reading from the backup file.
+                return zarr.open(f'{db_file_backup}_{str(timepoint).zfill(timepoint_digits)}.zarr{os.sep}{var_name}', dtype = dt, mode = 'r')
+            except:
+                raise Exception(f'{db_file}_{str(timepoint).zfill(timepoint_digits)}.zarr{os.sep}{var_name} and the corresponding backup file are not accessible.')
     
     """
     getCutout functions.
@@ -910,6 +1000,7 @@ class iso_cube:
                     min_corner_xyz = [current_x, current_y, current_z]
                     min_corner_info = self.get_file_for_mortoncode(self.mortoncurve.pack(min_corner_xyz[0] % self.N, min_corner_xyz[1] % self.N, min_corner_xyz[2] % self.N))
                     min_corner_db_file = min_corner_info[0]
+                    min_corner_basename = os.path.basename(min_corner_db_file)
                     database_file_disk = min_corner_db_file.split(os.sep)[self.database_file_disk_index]
                     box_minLim = min_corner_info[1]
                     max_corner_xyz = self.mortoncurve.unpack(min_corner_info[2])
@@ -920,8 +1011,13 @@ class iso_cube:
                     # specify the box that is fully inside a database file.
                     box = [[min_corner_xyz[i], min(max_corner_xyz[i] + cube_ms[i], box_max_xyz[i])] for i in range(3)]
                     
+                    # retrieve the backup filepath. '' handles datasets with with no backup file copies.
+                    min_corner_db_file_backup = ''
+                    if min_corner_basename in self.filepaths_backup:
+                        min_corner_db_file_backup = self.filepaths_backup[min_corner_basename]
+                    
                     # add the box axes ranges to the map.
-                    single_file_boxes[database_file_disk][min_corner_db_file].append(box)
+                    single_file_boxes[database_file_disk][min_corner_db_file, min_corner_db_file_backup].append(box)
 
                     # move to the next database file origin point.
                     current_x = max_corner_xyz[0] + cube_ms[0] + 1
@@ -929,7 +1025,7 @@ class iso_cube:
                 current_y = max_corner_xyz[1] + cube_ms[1] + 1
 
             current_z = max_corner_xyz[2] + cube_ms[2] + 1
-            
+    
         return single_file_boxes
         
     def read_database_files_sequentially(self, user_single_db_boxes):
@@ -938,7 +1034,7 @@ class iso_cube:
         for database_file_disk in user_single_db_boxes:
             # read in the voxel data from all of the database files on this disk.
             result_output_data += self.get_iso_points(user_single_db_boxes[database_file_disk],
-                                                      verbose = False)
+                                                      self.getcutout_vars, self.open_file_vars)
         
         return result_output_data
     
@@ -963,11 +1059,14 @@ class iso_cube:
             shutil.make_archive(data_dir + 'giverny', 'zip', root_dir = data_dir, base_dir = 'giverny' + os.sep)
             client.upload_file(data_dir + 'giverny.zip')
         except:
+            print(f'Starting a local dask cluster...')
+            sys.stdout.flush()
+            
             # update the distributed_cluster flag to False.
             distributed_cluster = False
             
             # using a local cluster if there is no premade distributed cluster.
-            cluster = LocalCluster(n_workers = self.dask_maximum_processes, processes = True)
+            cluster = LocalCluster(n_workers = self.dask_maximum_processes, processes = True, silence_logs = logging.ERROR)
             client = Client(cluster)
         
         # available workers.
@@ -979,10 +1078,13 @@ class iso_cube:
         
         result_output_data = []
         # iterate over the hard disk drives that the database files are stored on.
-        for database_file_disk in user_single_db_boxes:
+        for disk_index, database_file_disk in enumerate(user_single_db_boxes):
+            worker = workers[disk_index % num_workers]
+            
             # read in the voxel data from all of the database files on this disk.
             result_output_data.append(client.submit(self.get_iso_points, user_single_db_boxes[database_file_disk],
-                                                    verbose = False, workers = workers, pure = False))
+                                                    self.getcutout_vars, self.open_file_vars,
+                                                    workers = worker, pure = False))
         
         # gather all of the results once they are finished being run in parallel by dask.
         result_output_data = client.gather(result_output_data)        
@@ -1003,27 +1105,26 @@ class iso_cube:
         return result_output_data
     
     def get_iso_points(self, user_single_db_boxes_disk_data,
-                       verbose = False):
+                       getcutout_vars, open_file_vars):
         """
         retrieve the values for the specified var(iable) in the user-specified box and at the specified timepoint.
         """
-        # set the byte order for reading the data from the files.
-        dt = np.dtype(np.float32)
-        dt = dt.newbyteorder('<')
+        # assign the local variables.
+        file_size = getcutout_vars
         
         # the collection of local output data that will be returned to fill the complete output_data array.
         local_output_data = []
         # iterate over the database files to read the data from.
-        for db_file in user_single_db_boxes_disk_data:
-            zm = zarr.open(db_file + '_' + str(self.timepoint).zfill(self.timepoint_digits) + '.zarr' + os.sep + self.var_name, dtype = dt, mode = 'r')
+        for db_file, db_file_backup in user_single_db_boxes_disk_data:
+            zm = self.open_zarr_file(db_file, db_file_backup, open_file_vars)
             
             # iterate over the user box ranges corresponding to the morton voxels that will be read from this database file.
-            for user_box_ranges in user_single_db_boxes_disk_data[db_file]:
+            for user_box_ranges in user_single_db_boxes_disk_data[db_file, db_file_backup]:
                 # retrieve the minimum and maximum (x, y, z) coordinates of the database file box that is going to be read in.
                 min_xyz = [axis_range[0] for axis_range in user_box_ranges]
                 max_xyz = [axis_range[1] for axis_range in user_box_ranges]
                 # adjust the user box ranges to file size indices.
-                user_box_ranges = np.array(user_box_ranges) % self.file_size
+                user_box_ranges = np.array(user_box_ranges) % file_size
                 
                 # append the cutout into local_output_data.
                 local_output_data.append((zm[user_box_ranges[2][0] : user_box_ranges[2][1] + 1,
@@ -1032,47 +1133,6 @@ class iso_cube:
                                              min_xyz, max_xyz))
         
         return local_output_data
-    
-    def write_output_matrix_to_hdf5(self, output_data, output_filename):
-        # write output_data to a hdf5 file.
-        output_data.to_netcdf(self.output_path.joinpath(output_filename + '.h5'),
-                              format = "NETCDF4", mode = "w")
-        
-    def write_xmf(self, shape, h5_var_name, h5_attribute_type, h5_dataset_name, output_filename):
-        # write the xmf file that corresponds to the hdf5 file.
-        
-        # newline character.
-        nl = '\r\n'
-        
-        with open(self.output_path.joinpath(output_filename + '.xmf'), 'w') as tf:
-            print(f"<?xml version=\"1.0\" ?>{nl}", file = tf)
-            print(f"<!DOCTYPE Xdmf SYSTEM \"Xdmf.dtd\" []>{nl}", file = tf)
-            print(f"<Xdmf Version=\"2.0\">{nl}", file = tf)
-            print(f"  <Domain>{nl}", file = tf)
-            print(f"      <Grid Name=\"Structured Grid\" GridType=\"Uniform\">{nl}", file = tf)
-            print(f"        <Time Value=\"{self.timepoint + 1}\" />{nl}", file = tf)
-            print(f"        <Topology TopologyType=\"3DRectMesh\" NumberOfElements=\"{shape[2]} {shape[1]} {shape[0]}\"/>{nl}", file = tf)
-            print(f"        <Geometry GeometryType=\"VXVYVZ\">{nl}", file = tf)
-            print(f"          <DataItem Name=\"Xcoor\" Dimensions=\"{shape[0]}\" NumberType=\"Float\" Precision=\"4\" Format=\"HDF\">{nl}", file = tf)
-            print(f"            {output_filename}.h5:/xcoor{nl}", file = tf)
-            print(f"          </DataItem>{nl}", file = tf)
-            print(f"          <DataItem Name=\"Ycoor\" Dimensions=\"{shape[1]}\" NumberType=\"Float\" Precision=\"4\" Format=\"HDF\">{nl}", file = tf)
-            print(f"            {output_filename}.h5:/ycoor{nl}", file = tf)
-            print(f"          </DataItem>{nl}", file = tf)
-            print(f"          <DataItem Name=\"Zcoor\" Dimensions=\"{shape[2]}\" NumberType=\"Float\" Precision=\"4\" Format=\"HDF\">{nl}", file = tf)
-            print(f"            {output_filename}.h5:/zcoor{nl}", file = tf)
-            print(f"          </DataItem>{nl}", file = tf)
-            print(f"        </Geometry>{nl}", file = tf)
-            print(f"{nl}", file = tf)
-            print(f"        <Attribute Name=\"{h5_var_name}\" AttributeType=\"{h5_attribute_type}\" Center=\"Node\">{nl}", file = tf)
-            print(f"          <DataItem Dimensions=\"{shape[2]} {shape[1]} {shape[0]} {self.num_values_per_datapoint}\" NumberType=\"Float\" Precision=\"4\" Format=\"HDF\">{nl}", file = tf)
-            print(f"            {output_filename}.h5:/{h5_dataset_name}{nl}", file = tf)
-            print(f"          </DataItem>{nl}", file = tf)
-            print(f"        </Attribute>{nl}", file = tf)
-            print(f"      </Grid>{nl}", file = tf)
-            print(f"{nl}", file = tf)
-            print(f"  </Domain>{nl}", file = tf)
-            print(f"</Xdmf>{nl}", file = tf)
             
     """
     getVariable functions.
@@ -1081,6 +1141,13 @@ class iso_cube:
         # vectorize the mortoncurve.pack function.
         v_morton_pack = np.vectorize(self.mortoncurve.pack, otypes = [int])
         
+        # chunk cube size.
+        chunk_cube_size = 64**3
+        # empty array for subdividing chunk groups.
+        empty_array = np.array([0, 0, 0])
+        # chunk size array for subdividing chunk groups.
+        chunk_size_array = np.array([self.chunk_size, self.chunk_size, self.chunk_size]) - 1
+        
         # convert the points to the center point position within their own bucket.
         center_points = (points / self.dx % 1) + self.cube_min_index
         # convert the points to gridded datapoints.
@@ -1088,6 +1155,8 @@ class iso_cube:
         # calculate the minimum and maximum chunk (x, y, z) corner point for each point in datapoints.
         chunk_min_xyzs = ((datapoints - self.cube_min_index) - ((datapoints - self.cube_min_index) % self.chunk_size)) % self.N
         chunk_max_xyzs = ((datapoints + self.cube_max_index) + (self.chunk_size - ((datapoints + self.cube_max_index) % self.chunk_size) - 1)) % self.N
+        # chunk volumes.
+        chunk_volumes = np.prod(chunk_max_xyzs - chunk_min_xyzs + 1, axis = 1)
         # create the chunk keys for each chunk group.
         chunk_keys = [chunk_origin_group.tobytes() for chunk_origin_group in np.stack([chunk_min_xyzs, chunk_max_xyzs], axis = 1)]
         # convert chunk_min_xyzs and chunk_max_xyzs to indices in a single database file.
@@ -1102,50 +1171,324 @@ class iso_cube:
         # identify the database files that will need to be read for each chunk.
         db_min_files = [self.cornercode_file_map[morton_code] for morton_code in db_min_cornercodes]
         db_max_files = [self.cornercode_file_map[morton_code] for morton_code in db_max_cornercodes]
+        # retrieve the backup filepaths. '' handles datasets with with no backup file copies.
+        db_min_files_backup = [self.filepaths_backup[os.path.basename(db_min_file)] if os.path.basename(db_min_file) in self.filepaths_backup else '' \
+                               for db_min_file in db_min_files]
         
         # save the original indices for points, which corresponds to the orderering of the user-specified
         # points. these indices will be used for sorting output_data back to the user-specified points ordering.
         original_points_indices = [q for q in range(len(points))]
-        # zip the data.
-        zipped_data = sorted(zip(chunk_min_mortons, chunk_keys, db_min_files, db_max_files, points, datapoints, center_points,
-                                 chunk_min_xyzs, chunk_max_xyzs, chunk_min_mods, chunk_max_mods, original_points_indices), key = lambda x: (x[0], x[1]))
+        # zip the data. sort by volume first so that all fully overlapped chunk groups can be easily found.
+        zipped_data = sorted(zip(chunk_volumes, chunk_min_mortons, chunk_keys, db_min_files, db_max_files, db_min_files_backup, points, datapoints, center_points,
+                                 chunk_min_xyzs, chunk_max_xyzs, chunk_min_mods, chunk_max_mods, original_points_indices), key = lambda x: (-1 * x[0], x[1], x[2]))
         
         # map the native bucket points to their respective db files and chunks.
         db_native_map = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
         # store an array of visitor bucket points.
         db_visitor_map = []
+        # chunk key map used for storing all subdivided chunk groups to find fully overlapped chunk groups.
+        chunk_map = {}
         
-        for chunk_min_morton, chunk_key, db_min_file, db_max_file, point, datapoint, center_point, \
+        for chunk_volume, chunk_min_morton, chunk_key, db_min_file, db_max_file, db_min_file_backup, point, datapoint, center_point, \
             chunk_min_xyz, chunk_max_xyz, chunk_min_mod, chunk_max_mod, original_point_index in zipped_data:
             # update the database file info if the morton code is outside of the previous database fil maximum morton limit.
             db_disk = db_min_file.split(os.sep)[self.database_file_disk_index]
             
             if db_min_file == db_max_file:
+                # update the chunk key if the chunk group is fully contained in another larger chunk group.
+                updated_chunk_key = chunk_key
+                if chunk_key in chunk_map:
+                    updated_chunk_key = chunk_map[chunk_key]
+                elif chunk_volume != chunk_cube_size:
+                    chunk_map = self.subdivide_chunk_group(chunk_map, chunk_key, chunk_min_xyz, chunk_max_xyz, chunk_size_array, empty_array)
+                
                 # assign to native map.
-                if chunk_key not in db_native_map[db_disk][db_min_file]:
-                    db_native_map[db_disk][db_min_file][chunk_key].append((chunk_min_xyz, chunk_max_xyz, chunk_min_mod, chunk_max_mod))
+                if updated_chunk_key not in db_native_map[db_disk][db_min_file, db_min_file_backup]:
+                    db_native_map[db_disk][db_min_file, db_min_file_backup][updated_chunk_key].append((chunk_min_xyz, chunk_max_xyz, chunk_min_mod, chunk_max_mod))
     
-                db_native_map[db_disk][db_min_file][chunk_key].append((point, datapoint, center_point, original_point_index))
+                db_native_map[db_disk][db_min_file, db_min_file_backup][updated_chunk_key].append((point, datapoint, center_point, original_point_index))
             else:
                 # assign to the visitor map.
                 db_visitor_map.append((point, datapoint, center_point, original_point_index))
         
         return db_native_map, np.array(db_visitor_map, dtype = 'object')
     
-    def get_chunk_origin_groups(self, chunk_min_x, chunk_min_y, chunk_min_z, chunk_max_x, chunk_max_y, chunk_max_z):
+    def subdivide_chunk_group(self, chunk_map, chunk_key, chunk_min_xyz, chunk_max_xyz, chunk_size_array, empty_array): 
+        chunk_mins = []
+        chunk_maxs = []
+
+        # axes that are 2 chunks in length.
+        chunk_diffs = np.where(chunk_max_xyz - chunk_min_xyz + 1 == 2 * self.chunk_size)[0]
+        num_long_axes = len(chunk_diffs)
+
+        # 1-cubes, which are needed for all chunk groups (2, 4, or 8 chunks).
+        # long axis 1, first 1-cube.
+        chunk_mins.append(chunk_min_xyz)
+        new_max = chunk_min_xyz + chunk_size_array
+        chunk_maxs.append(new_max)
+
+        # long axis 1, second 1-cube.
+        new_min = chunk_min_xyz + empty_array
+        new_min[chunk_diffs[0]] += self.chunk_size
+        new_max = chunk_min_xyz + chunk_size_array
+        new_max[chunk_diffs[0]] += self.chunk_size
+        chunk_mins.append(new_min)
+        chunk_maxs.append(new_max)
+        
+        # add additional sub-chunks chunk group contains 4 or 8 chunks.
+        if num_long_axes == 2 or num_long_axes == 3:
+            # 1-cubes, additional.
+            # long axis 2, first 1-cube.
+            new_min = chunk_min_xyz + empty_array
+            new_min[chunk_diffs[1]] += self.chunk_size
+            new_max = chunk_min_xyz + chunk_size_array
+            new_max[chunk_diffs[1]] += self.chunk_size
+            chunk_mins.append(new_min)
+            chunk_maxs.append(new_max)
+
+            # long axis 2, second 1-cube.
+            new_min = chunk_min_xyz + empty_array
+            new_min[chunk_diffs[0]] += self.chunk_size
+            new_min[chunk_diffs[1]] += self.chunk_size
+            new_max = chunk_min_xyz + chunk_size_array
+            new_max[chunk_diffs[0]] += self.chunk_size
+            new_max[chunk_diffs[1]] += self.chunk_size
+            chunk_mins.append(new_min)
+            chunk_maxs.append(new_max)
+
+            # 2-cubes.
+            # long axis 1, first 2-cube.
+            new_max = chunk_min_xyz + chunk_size_array
+            new_max[chunk_diffs[0]] += self.chunk_size
+            chunk_mins.append(chunk_min_xyz)
+            chunk_maxs.append(new_max)
+
+            # long axis 1, second 2-cube.
+            new_min = chunk_min_xyz + empty_array
+            new_min[chunk_diffs[1]] += self.chunk_size
+            new_max = chunk_min_xyz + chunk_size_array
+            new_max[chunk_diffs[0]] += self.chunk_size
+            new_max[chunk_diffs[1]] += self.chunk_size
+            chunk_mins.append(new_min)
+            chunk_maxs.append(new_max)
+            
+            # long axis 2, first 2-cube.
+            new_max = chunk_min_xyz + chunk_size_array
+            new_max[chunk_diffs[1]] += self.chunk_size
+            chunk_mins.append(chunk_min_xyz)
+            chunk_maxs.append(new_max)
+
+            # long axis 2, second 2-cube.
+            new_min = chunk_min_xyz + empty_array
+            new_min[chunk_diffs[0]] += self.chunk_size
+            new_max = chunk_min_xyz + chunk_size_array
+            new_max[chunk_diffs[0]] += self.chunk_size
+            new_max[chunk_diffs[1]] += self.chunk_size
+            chunk_mins.append(new_min)
+            chunk_maxs.append(new_max)
+        
+            if num_long_axes == 3:
+                # 1-cubes, additional.
+                # long axis 3, first 1-cube.
+                new_min = chunk_min_xyz + empty_array
+                new_min[chunk_diffs[2]] += self.chunk_size
+                new_max = chunk_min_xyz + chunk_size_array
+                new_max[chunk_diffs[2]] += self.chunk_size
+                chunk_mins.append(new_min)
+                chunk_maxs.append(new_max)
+
+                # long axis 3, second 1-cube.
+                new_min = chunk_min_xyz + empty_array
+                new_min[chunk_diffs[0]] += self.chunk_size
+                new_min[chunk_diffs[2]] += self.chunk_size
+                new_max = chunk_min_xyz + chunk_size_array
+                new_max[chunk_diffs[0]] += self.chunk_size
+                new_max[chunk_diffs[2]] += self.chunk_size
+                chunk_mins.append(new_min)
+                chunk_maxs.append(new_max)
+
+                # long axis 3, third 1-cube.
+                new_min = chunk_min_xyz + empty_array
+                new_min[chunk_diffs[1]] += self.chunk_size
+                new_min[chunk_diffs[2]] += self.chunk_size
+                new_max = chunk_min_xyz + chunk_size_array
+                new_max[chunk_diffs[1]] += self.chunk_size
+                new_max[chunk_diffs[2]] += self.chunk_size
+                chunk_mins.append(new_min)
+                chunk_maxs.append(new_max)
+
+                # long axis 3, fourth 1-cube.
+                new_min = chunk_min_xyz + empty_array
+                new_min[chunk_diffs[0]] += self.chunk_size
+                new_min[chunk_diffs[1]] += self.chunk_size
+                new_min[chunk_diffs[2]] += self.chunk_size
+                new_max = chunk_min_xyz + chunk_size_array
+                new_max[chunk_diffs[0]] += self.chunk_size
+                new_max[chunk_diffs[1]] += self.chunk_size
+                new_max[chunk_diffs[2]] += self.chunk_size
+                chunk_mins.append(new_min)
+                chunk_maxs.append(new_max)
+
+                # 2-cubes, additional.
+                # long axis 1, third 2-cube.
+                new_min = chunk_min_xyz + empty_array
+                new_min[chunk_diffs[2]] += self.chunk_size
+                new_max = chunk_min_xyz + chunk_size_array
+                new_max[chunk_diffs[0]] += self.chunk_size
+                new_max[chunk_diffs[2]] += self.chunk_size
+                chunk_mins.append(new_min)
+                chunk_maxs.append(new_max)
+
+                # long axis 1, fourth 2-cube.
+                new_min = chunk_min_xyz + empty_array
+                new_min[chunk_diffs[1]] += self.chunk_size
+                new_min[chunk_diffs[2]] += self.chunk_size
+                new_max = chunk_min_xyz + chunk_size_array
+                new_max[chunk_diffs[0]] += self.chunk_size
+                new_max[chunk_diffs[1]] += self.chunk_size
+                new_max[chunk_diffs[2]] += self.chunk_size
+                chunk_mins.append(new_min)
+                chunk_maxs.append(new_max)
+                
+                # long axis 2, third 2-cube.
+                new_min = chunk_min_xyz + empty_array
+                new_min[chunk_diffs[2]] += self.chunk_size
+                new_max = chunk_min_xyz + chunk_size_array
+                new_max[chunk_diffs[1]] += self.chunk_size
+                new_max[chunk_diffs[2]] += self.chunk_size
+                chunk_mins.append(new_min)
+                chunk_maxs.append(new_max)
+
+                # long axis 2, fourth 2-cube.
+                new_min = chunk_min_xyz + empty_array
+                new_min[chunk_diffs[0]] += self.chunk_size
+                new_min[chunk_diffs[2]] += self.chunk_size
+                new_max = chunk_min_xyz + chunk_size_array
+                new_max[chunk_diffs[0]] += self.chunk_size
+                new_max[chunk_diffs[1]] += self.chunk_size
+                new_max[chunk_diffs[2]] += self.chunk_size
+                chunk_mins.append(new_min)
+                chunk_maxs.append(new_max)
+                
+                # long axis 3, first 2-cube.
+                new_max = chunk_min_xyz + chunk_size_array
+                new_max[chunk_diffs[2]] += self.chunk_size
+                chunk_mins.append(chunk_min_xyz)
+                chunk_maxs.append(new_max)
+
+                # long axis 3, second 2-cube.
+                new_min = chunk_min_xyz + empty_array
+                new_min[chunk_diffs[0]] += self.chunk_size
+                new_max = chunk_min_xyz + chunk_size_array
+                new_max[chunk_diffs[0]] += self.chunk_size
+                new_max[chunk_diffs[2]] += self.chunk_size
+                chunk_mins.append(new_min)
+                chunk_maxs.append(new_max)
+
+                # long axis 3, third 2-cube.
+                new_min = chunk_min_xyz + empty_array
+                new_min[chunk_diffs[1]] += self.chunk_size
+                new_max = chunk_min_xyz + chunk_size_array
+                new_max[chunk_diffs[1]] += self.chunk_size
+                new_max[chunk_diffs[2]] += self.chunk_size
+                chunk_mins.append(new_min)
+                chunk_maxs.append(new_max)
+
+                # long axis 3, fourth 2-cube.
+                new_min = chunk_min_xyz + empty_array
+                new_min[chunk_diffs[0]] += self.chunk_size
+                new_min[chunk_diffs[1]] += self.chunk_size
+                new_max = chunk_min_xyz + chunk_size_array
+                new_max[chunk_diffs[0]] += self.chunk_size
+                new_max[chunk_diffs[1]] += self.chunk_size
+                new_max[chunk_diffs[2]] += self.chunk_size
+                chunk_mins.append(new_min)
+                chunk_maxs.append(new_max)
+
+                # 4-cubes.
+                # long axes 1 and 2, first 4-cube.
+                new_min = chunk_min_xyz + empty_array
+                new_max = chunk_min_xyz + chunk_size_array
+                new_max[chunk_diffs[0]] += self.chunk_size
+                new_max[chunk_diffs[1]] += self.chunk_size
+                chunk_mins.append(new_min)
+                chunk_maxs.append(new_max)
+
+                # long axes 1 and 2, second 4-cube.
+                new_min = chunk_min_xyz + empty_array
+                new_min[chunk_diffs[2]] += self.chunk_size
+                new_max = chunk_min_xyz + chunk_size_array
+                new_max[chunk_diffs[0]] += self.chunk_size
+                new_max[chunk_diffs[1]] += self.chunk_size
+                new_max[chunk_diffs[2]] += self.chunk_size
+                chunk_mins.append(new_min)
+                chunk_maxs.append(new_max)
+
+                # long axes 1 and 3, first 4-cube.
+                new_min = chunk_min_xyz + empty_array
+                new_max = chunk_min_xyz + chunk_size_array
+                new_max[chunk_diffs[0]] += self.chunk_size
+                new_max[chunk_diffs[2]] += self.chunk_size
+                chunk_mins.append(new_min)
+                chunk_maxs.append(new_max)
+
+                # long axes 1 and 3, second 4-cube.
+                new_min = chunk_min_xyz + empty_array
+                new_min[chunk_diffs[1]] += self.chunk_size
+                new_max = chunk_min_xyz + chunk_size_array
+                new_max[chunk_diffs[0]] += self.chunk_size
+                new_max[chunk_diffs[1]] += self.chunk_size
+                new_max[chunk_diffs[2]] += self.chunk_size
+                chunk_mins.append(new_min)
+                chunk_maxs.append(new_max)
+
+                # long axes 2 and 3, first 4-cube.
+                new_min = chunk_min_xyz + empty_array
+                new_max = chunk_min_xyz + chunk_size_array
+                new_max[chunk_diffs[1]] += self.chunk_size
+                new_max[chunk_diffs[2]] += self.chunk_size
+                chunk_mins.append(new_min)
+                chunk_maxs.append(new_max)
+
+                # long axes 2 and 3, second 4-cube.
+                new_min = chunk_min_xyz + empty_array
+                new_min[chunk_diffs[0]] += self.chunk_size
+                new_max = chunk_min_xyz + chunk_size_array
+                new_max[chunk_diffs[0]] += self.chunk_size
+                new_max[chunk_diffs[1]] += self.chunk_size
+                new_max[chunk_diffs[2]] += self.chunk_size
+                chunk_mins.append(new_min)
+                chunk_maxs.append(new_max)
+
+        # whole cube.
+        chunk_mins.append(chunk_min_xyz)
+        chunk_maxs.append(chunk_max_xyz)
+
+        # convert to numpy arrays.
+        chunk_mins = np.array(chunk_mins)
+        chunk_maxs = np.array(chunk_maxs)
+
+        # update chunk_map with all of the new keys.
+        chunk_keys = [chunk_origin_group.tobytes() for chunk_origin_group in np.stack([chunk_mins, chunk_maxs], axis = 1)]
+        for key in chunk_keys:
+            chunk_map[key] = chunk_key
+
+        return chunk_map
+    
+    def get_chunk_origin_groups(self, chunk_min_x, chunk_min_y, chunk_min_z, chunk_max_x, chunk_max_y, chunk_max_z, N, chunk_size):
         # get arrays of the chunk origin points for each bucket.
         return np.array([[x, y, z]
-                         for z in range(chunk_min_z, (chunk_max_z if chunk_min_z <= chunk_max_z else self.N + chunk_max_z) + 1, self.chunk_size)
-                         for y in range(chunk_min_y, (chunk_max_y if chunk_min_y <= chunk_max_y else self.N + chunk_max_y) + 1, self.chunk_size)
-                         for x in range(chunk_min_x, (chunk_max_x if chunk_min_x <= chunk_max_x else self.N + chunk_max_x) + 1, self.chunk_size)])
+                         for z in range(chunk_min_z, (chunk_max_z if chunk_min_z <= chunk_max_z else N + chunk_max_z) + 1, chunk_size)
+                         for y in range(chunk_min_y, (chunk_max_y if chunk_min_y <= chunk_max_y else N + chunk_max_y) + 1, chunk_size)
+                         for x in range(chunk_min_x, (chunk_max_x if chunk_min_x <= chunk_max_x else N + chunk_max_x) + 1, chunk_size)])
     
     def read_natives_sequentially_variable(self, db_native_map, native_output_data):
         # native data.
         # iterate over the data volumes that the database files are stored on.
         for database_file_disk in db_native_map:
             # read in the voxel data from all of the database files on this disk.
-            print('db path: ', db_native_map[database_file_disk])
-            native_output_data += self.get_iso_points_variable(db_native_map[database_file_disk], verbose = False)
+            native_output_data += self.get_iso_points_variable(db_native_map[database_file_disk],
+                                                               self.open_file_vars, self.interpolate_vars)
             
     def read_visitors_in_parallel_variable(self, db_visitor_map, visitor_output_data):
         # visitor data.
@@ -1167,16 +1510,22 @@ class iso_cube:
                 shutil.make_archive(data_dir + 'giverny', 'zip', root_dir = data_dir, base_dir = 'giverny' + os.sep)
                 client.upload_file(data_dir + 'giverny.zip')
             except:
+                print(f'Starting a local dask cluster...')
+                sys.stdout.flush()
+            
                 # update the distributed_cluster flag to False.
                 distributed_cluster = False
 
                 # using a local cluster if there is no premade distributed cluster.
-                cluster = LocalCluster(n_workers = self.dask_maximum_processes, processes = True)
+                cluster = LocalCluster(n_workers = self.dask_maximum_processes, processes = True, silence_logs = logging.ERROR)
                 client = Client(cluster)
     
             # available workers.
             workers = list(client.scheduler_info()['workers'])
             num_workers = len(workers)
+            
+            print(f'Database files are being read in parallel...')
+            sys.stdout.flush()
             
             # calculate how many chunks to use for splitting up the visitor map data.
             num_visitor_points = len(db_visitor_map)
@@ -1191,7 +1540,9 @@ class iso_cube:
             # scatter the chunks to their own worker and submit each chunk for parallel processing.
             for db_visitor_map_chunk, worker in zip(db_visitor_map_split, workers):
                 # submit the chunk for parallel processing.
-                temp_visitor_output_data.append(client.submit(self.get_iso_points_variable_visitor, db_visitor_map_chunk, verbose = False, workers = worker, pure = False))
+                temp_visitor_output_data.append(client.submit(self.get_iso_points_variable_visitor, db_visitor_map_chunk,
+                                                              self.getvariable_vars, self.open_file_vars, self.interpolate_vars,
+                                                              workers = worker, pure = False))
                 
             # gather all of the results once they are finished being run in parallel by dask.
             temp_visitor_output_data = client.gather(temp_visitor_output_data)
@@ -1213,6 +1564,10 @@ class iso_cube:
                 cluster.close() 
             
     def read_database_files_sequentially_variable(self, db_native_map, db_visitor_map):
+        if len(db_visitor_map) == 0:
+            print('Database files are being read sequentially...')
+            sys.stdout.flush()
+        
         # create empty lists for filling the output data.
         native_output_data = []
         visitor_output_data = []
@@ -1254,11 +1609,14 @@ class iso_cube:
             shutil.make_archive(data_dir + 'giverny', 'zip', root_dir = data_dir, base_dir = 'giverny' + os.sep)
             client.upload_file(data_dir + 'giverny.zip')
         except:
+            print(f'Starting a local dask cluster...')
+            sys.stdout.flush()
+            
             # update the distributed_cluster flag to False.
             distributed_cluster = False
             
             # using a local cluster if there is no premade distributed cluster.
-            cluster = LocalCluster(n_workers = self.dask_maximum_processes, processes = True)
+            cluster = LocalCluster(n_workers = self.dask_maximum_processes, processes = True, silence_logs = logging.ERROR)
             client = Client(cluster)
         
         # available workers.
@@ -1277,8 +1635,9 @@ class iso_cube:
                 worker = workers[disk_index % num_workers] 
                 
                 # submit the data for parallel processing.
-                result_output_data.append(client.submit(self.get_iso_points_variable, db_native_map[database_file_disk], verbose = False,
-                                                            workers = worker, pure = False))
+                result_output_data.append(client.submit(self.get_iso_points_variable, db_native_map[database_file_disk],
+                                                        self.open_file_vars, self.interpolate_vars,
+                                                        workers = worker, pure = False))
         
         # visitor buckets.
         # -----
@@ -1295,7 +1654,9 @@ class iso_cube:
             # scatter the chunks to their own worker and submit the chunk for parallel processing.
             for db_visitor_map_chunk, worker in zip(db_visitor_map_split, workers):
                 # submit the data for parallel processing.
-                result_output_data.append(client.submit(self.get_iso_points_variable_visitor, db_visitor_map_chunk, verbose = False, workers = worker, pure = False))
+                result_output_data.append(client.submit(self.get_iso_points_variable_visitor, db_visitor_map_chunk,
+                                                        self.getvariable_vars, self.open_file_vars, self.interpolate_vars,
+                                                        workers = worker, pure = False))
         
         # gather all of the results once they are finished being run in parallel by dask.
         result_output_data = client.gather(result_output_data)        
@@ -1315,21 +1676,24 @@ class iso_cube:
                 
         return result_output_data
     
-    def get_iso_points_variable(self, db_native_map_data, verbose = False):
+    def get_iso_points_variable(self, db_native_map_data,
+                                open_file_vars, interpolate_vars):
         """
         reads and interpolates the user-requested native points in a single database volume.
         """
-        # set the byte order for reading the data from the files.
-        dt = np.dtype(np.float32)
-        dt = dt.newbyteorder('<')
+        # assign the local variables.
+        cube_min_index, cube_max_index, sint = interpolate_vars[:3]
+        
+        # initialize the interpolation lookup table.
+        self.init_interpolation_lookup_table(sint = sint, read_metadata = True)
         
         # the collection of local output data that will be returned to fill the complete output_data array.
         local_output_data = []
         # iterate over the database files and morton sub-boxes to read the data from.
-        for db_file in db_native_map_data:
-            zs = zarr.open(db_file + '_' + str(self.timepoint) + '.zarr' + os.sep + self.var_name, dtype = dt, mode = 'r')
+        for db_file, db_file_backup in db_native_map_data:
+            zs = self.open_zarr_file(db_file, db_file_backup, open_file_vars)
             
-            db_file_data = db_native_map_data[db_file]
+            db_file_data = db_native_map_data[db_file, db_file_backup]
             for chunk_key in db_file_data:
                 chunk_data = db_file_data[chunk_key]
                 chunk_min_xyz = chunk_data[0][0]
@@ -1342,102 +1706,117 @@ class iso_cube:
                 
                 # iterate over the points to interpolate.
                 for point, datapoint, center_point, original_point_index in chunk_data[1:]:
-                    bucket_min_xyz = datapoint - chunk_min_xyz - self.cube_min_index
-                    bucket_max_xyz = datapoint - chunk_min_xyz + self.cube_max_index + 1
+                    bucket_min_xyz = datapoint - chunk_min_xyz - cube_min_index
+                    bucket_max_xyz = datapoint - chunk_min_xyz + cube_max_index + 1
 
                     bucket = zm[bucket_min_xyz[2] : bucket_max_xyz[2],
                                 bucket_min_xyz[1] : bucket_max_xyz[1],
                                 bucket_min_xyz[0] : bucket_max_xyz[0]]
             
                     # interpolate the points and use a lookup table for faster interpolations.
-                    local_output_data.append((original_point_index, (point, self.interpLagL(center_point, bucket))))
+                    local_output_data.append((original_point_index, (point, self.interpolate(center_point, bucket, interpolate_vars))))
         
         return local_output_data
     
-    def get_iso_points_variable_visitor(self, visitor_data, verbose = False):
-            """
-            reads and interpolates the user-requested visitor points.
-            """
-            # set the byte order for reading the data from the files.
-            dt = np.dtype(np.float32)
-            dt = dt.newbyteorder('<')
+    def get_iso_points_variable_visitor(self, visitor_data,
+                                        getvariable_vars, open_file_vars, interpolate_vars):
+        """
+        reads and interpolates the user-requested visitor points.
+        """
+        # assign the local variables.
+        cube_min_index, cube_max_index, sint = interpolate_vars[:3]
+        dataset_title, num_values_per_datapoint, N, chunk_size, file_size = getvariable_vars
+        
+        # get map of the filepaths for all of the dataset files.
+        self.init_filepaths(dataset_title)
+        
+        # get a map of the files to cornercodes for all of the dataset files.
+        self.init_cornercode_file_map(dataset_title, N)
+        
+        # initialize the interpolation lookup table.
+        self.init_interpolation_lookup_table(sint = sint, read_metadata = True)
+        
+        # vectorize the mortoncurve.pack function.
+        v_morton_pack = np.vectorize(self.mortoncurve.pack, otypes = [int])
 
-            # vectorize the mortoncurve.pack function.
-            v_morton_pack = np.vectorize(self.mortoncurve.pack, otypes = [int])
+        # the collection of local output data that will be returned to fill the complete output_data array.
+        local_output_data = []
 
-            # the collection of local output data that will be returned to fill the complete output_data array.
-            local_output_data = []
+        # empty chunk group array (up to eight 64-cube chunks).
+        zm = np.zeros((128, 128, 128, num_values_per_datapoint))
 
-            # empty chunk group array (up to eight 64-cube chunks).
-            zm = np.zeros((128, 128, 128, self.num_values_per_datapoint))
+        datapoints = np.array([datapoint for datapoint in visitor_data[:, 1]])
+        # calculate the minimum and maximum chunk group corner point (x, y, z) for each datapoint.
+        chunk_min_xyzs = ((datapoints - cube_min_index) - ((datapoints - cube_min_index) % chunk_size)) % N
+        chunk_max_xyzs = ((datapoints + cube_max_index) + (chunk_size - ((datapoints + cube_max_index) % chunk_size) - 1)) % N
+        # calculate the morton codes for the minimum (x, y, z) point of each chunk group.
+        chunk_min_mortons = v_morton_pack(chunk_min_xyzs[:, 0], chunk_min_xyzs[:, 1], chunk_min_xyzs[:, 2])
+        # create the chunk keys for each chunk group.
+        chunk_keys = [chunk_origin_group.tobytes() for chunk_origin_group in np.stack([chunk_min_xyzs, chunk_max_xyzs], axis = 1)]
+        # calculate the minimum and maximum bucket corner point (x, y, z) for each datapoint.
+        bucket_min_xyzs = (datapoints - chunk_min_xyzs - cube_min_index) % N
+        bucket_max_xyzs = (datapoints - chunk_min_xyzs + cube_max_index + 1) % N
+        # create the bucket keys for each interpolation bucket.
+        bucket_keys = [bucket_origin_group.tobytes() for bucket_origin_group in np.stack([bucket_min_xyzs, bucket_max_xyzs], axis = 1)]
 
-            datapoints = np.array([datapoint for datapoint in visitor_data[:, 1]])
-            # calculate the minimum and maximum chunk group corner point (x, y, z) for each datapoint.
-            chunk_min_xyzs = ((datapoints - self.cube_min_index) - ((datapoints - self.cube_min_index) % self.chunk_size)) % self.N
-            chunk_max_xyzs = ((datapoints + self.cube_max_index) + (self.chunk_size - ((datapoints + self.cube_max_index) % self.chunk_size) - 1)) % self.N
-            # calculate the morton codes for the minimum (x, y, z) point of each chunk group.
-            chunk_min_mortons = v_morton_pack(chunk_min_xyzs[:, 0], chunk_min_xyzs[:, 1], chunk_min_xyzs[:, 2])
-            # create the chunk keys for each chunk group.
-            chunk_keys = [chunk_origin_group.tobytes() for chunk_origin_group in np.stack([chunk_min_xyzs, chunk_max_xyzs], axis = 1)]
-            # calculate the minimum and maximum bucket corner point (x, y, z) for each datapoint.
-            bucket_min_xyzs = (datapoints - chunk_min_xyzs - self.cube_min_index) % self.N
-            bucket_max_xyzs = (datapoints - chunk_min_xyzs + self.cube_max_index + 1) % self.N
-            # create the bucket keys for each interpolation bucket.
-            bucket_keys = [bucket_origin_group.tobytes() for bucket_origin_group in np.stack([bucket_min_xyzs, bucket_max_xyzs], axis = 1)]
+        current_chunk = ''
+        current_bucket = ''
+        for point_data, chunk_min_morton, chunk_min_xyz, chunk_max_xyz, chunk_key, bucket_min_xyz, bucket_max_xyz, bucket_key in \
+            sorted(zip(visitor_data, chunk_min_mortons, chunk_min_xyzs, chunk_max_xyzs, chunk_keys, bucket_min_xyzs, bucket_max_xyzs, bucket_keys),
+                   key = lambda x: (x[1], x[4], x[7])):
+            if current_chunk != chunk_key:
+                # get the origin points for each voxel in the bucket.
+                chunk_origin_groups = self.get_chunk_origin_groups(chunk_min_xyz[0], chunk_min_xyz[1], chunk_min_xyz[2],
+                                                                   chunk_max_xyz[0], chunk_max_xyz[1], chunk_max_xyz[2],
+                                                                   N, chunk_size)
+                # adjust the chunk origin points to the chunk domain size for filling the empty chunk group array.
+                chunk_origin_points = chunk_origin_groups - chunk_origin_groups[0]
 
-            current_chunk = ''
-            current_bucket = ''
-            for point_data, chunk_min_morton, chunk_min_xyz, chunk_max_xyz, chunk_key, bucket_min_xyz, bucket_max_xyz, bucket_key in \
-                sorted(zip(visitor_data, chunk_min_mortons, chunk_min_xyzs, chunk_max_xyzs, chunk_keys, bucket_min_xyzs, bucket_max_xyzs, bucket_keys),
-                       key = lambda x: (x[1], x[4], x[7])):
-                if current_chunk != chunk_key:
-                    # get the origin points for each voxel in the bucket.
-                    chunk_origin_groups = self.get_chunk_origin_groups(chunk_min_xyz[0], chunk_min_xyz[1], chunk_min_xyz[2],
-                                                                       chunk_max_xyz[0], chunk_max_xyz[1], chunk_max_xyz[2])
-                    # adjust the chunk origin points to the chunk domain size for filling the empty chunk group array.
-                    chunk_origin_points = chunk_origin_groups - chunk_origin_groups[0]
+                # get the chunk origin group inside the dataset domain.
+                chunk_origin_groups = chunk_origin_groups % N
+                # calculate the morton codes for the minimum point in each chunk of the chunk groups.
+                morton_mins = v_morton_pack(chunk_origin_groups[:, 0], chunk_origin_groups[:, 1], chunk_origin_groups[:, 2])
+                # get the chunk origin group inside the file domain.
+                chunk_origin_groups = chunk_origin_groups % file_size
 
-                    # get the chunk origin group inside the dataset domain.
-                    chunk_origin_groups = chunk_origin_groups % self.N
-                    # calculate the morton codes for the minimum point in each chunk of the chunk groups.
-                    morton_mins = v_morton_pack(chunk_origin_groups[:, 0], chunk_origin_groups[:, 1], chunk_origin_groups[:, 2])
-                    # get the chunk origin group inside the file domain.
-                    chunk_origin_groups = chunk_origin_groups % self.file_size
+                # calculate the db file cornercodes for each morton code.
+                db_cornercodes = (morton_mins >> 27) << 27
+                # identify the database files that will need to be read for this bucket.
+                db_files = [self.cornercode_file_map[morton_code] for morton_code in db_cornercodes]
+                # retrieve the backup filepaths. '' handles datasets with with no backup file copies.
+                db_files_backup = [self.filepaths_backup[os.path.basename(db_file)] if os.path.basename(db_file) in self.filepaths_backup else '' \
+                                   for db_file in db_files]
 
-                    # calculate the db file cornercodes for each morton code.
-                    db_cornercodes = (morton_mins >> 27) << 27
-                    # identify the database files that will need to be read for this bucket.
-                    db_files = [self.cornercode_file_map[morton_code] for morton_code in db_cornercodes]
+                current_file = ''
+                # iterate of the db files.
+                for db_file, db_file_backup, chunk_origin_point, chunk_origin_group in sorted(zip(db_files, db_files_backup, chunk_origin_points, chunk_origin_groups),
+                                                                                              key = lambda x: x[0]):
+                    if db_file != current_file:
+                        # create an open file object of the database file.
+                        zs = self.open_zarr_file(db_file, db_file_backup, open_file_vars)
 
-                    current_file = ''
-                    # iterate of the db files.
-                    for db_file, chunk_origin_point, chunk_origin_group in sorted(zip(db_files, chunk_origin_points, chunk_origin_groups), key = lambda x: x[0]):
-                        if db_file != current_file:
-                            # create an open file object of the database file.
-                            zs = zarr.open(db_file + '_' + str(self.timepoint) + '.zarr' + os.sep + self.var_name, dtype = dt, mode = 'r')
+                        # update current_file.
+                        current_file = db_file
 
-                            # update current_file.
-                            current_file = db_file
+                    zm[chunk_origin_point[2] : chunk_origin_point[2] + chunk_size,
+                       chunk_origin_point[1] : chunk_origin_point[1] + chunk_size,
+                       chunk_origin_point[0] : chunk_origin_point[0] + chunk_size] = zs[chunk_origin_group[2] : chunk_origin_group[2] + chunk_size,
+                                                                                        chunk_origin_group[1] : chunk_origin_group[1] + chunk_size,
+                                                                                        chunk_origin_group[0] : chunk_origin_group[0] + chunk_size]
 
-                        zm[chunk_origin_point[2] : chunk_origin_point[2] + self.chunk_size,
-                           chunk_origin_point[1] : chunk_origin_point[1] + self.chunk_size,
-                           chunk_origin_point[0] : chunk_origin_point[0] + self.chunk_size] = zs[chunk_origin_group[2] : chunk_origin_group[2] + self.chunk_size,
-                                                                                                 chunk_origin_group[1] : chunk_origin_group[1] + self.chunk_size,
-                                                                                                 chunk_origin_group[0] : chunk_origin_group[0] + self.chunk_size]
+                # update current_chunk.
+                current_chunk = chunk_key
 
-                    # update current_chunk.
-                    current_chunk = chunk_key
+            if current_bucket != bucket_key:
+                bucket = zm[bucket_min_xyz[2] : bucket_max_xyz[2],
+                            bucket_min_xyz[1] : bucket_max_xyz[1],
+                            bucket_min_xyz[0] : bucket_max_xyz[0]]
 
-                if current_bucket != bucket_key:
-                    bucket = zm[bucket_min_xyz[2] : bucket_max_xyz[2],
-                                bucket_min_xyz[1] : bucket_max_xyz[1],
-                                bucket_min_xyz[0] : bucket_max_xyz[0]]
+                # update current_bucket.
+                current_bucket = bucket_key
 
-                    # update current_bucket.
-                    current_bucket = bucket_key
+            # interpolate the point and use a lookup table for faster interpolation.
+            local_output_data.append((point_data[3], (point_data[0], self.interpolate(point_data[2], bucket, interpolate_vars))))
 
-                # interpolate the point and use a lookup table for faster interpolation.
-                local_output_data.append((point_data[3], (point_data[0], self.interpLagL(point_data[2], bucket))))
-
-            return local_output_data
+        return local_output_data
     

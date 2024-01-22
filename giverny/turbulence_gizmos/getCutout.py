@@ -9,8 +9,7 @@ from giverny.turbulence_gizmos.basic_gizmos import *
 
 def getCutout_process_data(cube, axes_ranges, var, timepoint,
                            axes_ranges_original, strides, var_original, timepoint_original,
-                           time_step = 1, filter_width = 1,
-                           rewrite_metadata = False):
+                           time_step = 1, filter_width = 1):
     # calculate how much time it takes to run the code.
     start_time = time.perf_counter()
 
@@ -23,19 +22,24 @@ def getCutout_process_data(cube, axes_ranges, var, timepoint,
     # data this value is 3, because there is a velocity measurement along each axis.
     num_values_per_datapoint = get_num_values_per_datapoint(var)
     
-    # placeholder spatial interpolation value which is not used for getCutout.
-    sint = ''
+    # placeholder spatial interpolation and temporal interpolation values which are not used for getCutout.
+    sint = 'none'
+    tint = 'none'
     # initialize cube constants.
-    cube.init_constants(var, var_original, timepoint, sint, num_values_per_datapoint, c, rewrite_metadata)
+    cube.init_constants(var, var_original, timepoint, sint, tint, num_values_per_datapoint, c)
 
     # used for determining the indices in the output array for each x, y, z datapoint.
     axes_min = axes_ranges[:, 0]
+    
+    # number of original datapoints along each axis specified by the user. used for checking that the user did not request
+    # too much data.
+    axes_lengths_original = axes_ranges_original[:, 1] - axes_ranges_original[:, 0] + 1
 
     # used for creating the 3-D output array using numpy.
     axes_lengths = axes_ranges[:, 1] - axes_ranges[:, 0] + 1
 
     # total number of datapoints, used for checking if the user requested too much data.
-    num_datapoints = np.prod(axes_lengths)
+    num_datapoints = np.prod(axes_lengths_original)
     # total size of data, in GBs, requested by the user's box.
     requested_data_size = (num_datapoints * c['bytes_per_datapoint'] * num_values_per_datapoint) / float(1024**3)
     # maximum number of datapoints that can be read in. currently set to 3 GBs worth of datapoints.
@@ -83,7 +87,7 @@ def getCutout_process_data(cube, axes_ranges, var, timepoint,
     start_time_step2 = time.perf_counter()
     
     # pre-fill the output data 3-d array that will be filled with the data that is read in. initially the datatype is set to "f" (float)
-    # so that the array is filled with the missing placeholder values (-999.9).
+    # so that the array is filled with the missing placeholder values (-999.9). 
     output_data = np.full((axes_lengths[2], axes_lengths[1], axes_lengths[0], num_values_per_datapoint),
                            fill_value = c['missing_value_placeholder'], dtype = 'f')
     
@@ -106,14 +110,14 @@ def getCutout_process_data(cube, axes_ranges, var, timepoint,
     
     # determines how many copies of data need to be me made along each axis when the number of datapoints the user specified
     # exceeds the cube resolution (cube.N). note: no copies of the data values should be made, hence data_value_multiplier equals 1.
-    axes_multipliers = np.ceil(axes_lengths / cube.N).astype(int)
+    axes_multipliers = np.ceil(axes_lengths_original / cube.N).astype(int)
     data_value_multiplier = 1
     
     # duplicates the data along the z-, y-, and x-axes of output_data if the the user asked for more datapoints than the cube resolution along any axis.
     if np.any(axes_multipliers > 1):
         output_data = np.tile(output_data, (axes_multipliers[2], axes_multipliers[1], axes_multipliers[0], data_value_multiplier))
         # truncate any extra datapoints from the duplicate data outside of the original range of the datapoints specified by the user.
-        output_data = np.copy(output_data[0 : axes_lengths[2], 0 : axes_lengths[1], 0 : axes_lengths[0], :])
+        output_data = np.copy(output_data[0 : axes_lengths_original[2], 0 : axes_lengths_original[1], 0 : axes_lengths_original[0], :])
     
     # create axis coordinate ranges, shifted to 0-based indices, to store in the xarray metadata.
     z_coords = np.around(np.arange(axes_ranges_original[2][0] - 1, axes_ranges_original[2][1], strides[2], dtype = np.float32) * cube.dx, decimals = c['decimals'])
@@ -122,7 +126,6 @@ def getCutout_process_data(cube, axes_ranges, var, timepoint,
     
     # set the dataset name to be used in the hdf5 file.
     h5_var_name = get_output_variable_name(var_original)
-    h5_attribute_type = get_attribute_type(var_original)
     h5_dataset_name = h5_var_name + '_' + str(timepoint_original).zfill(4)
     
     # apply the strides to output_data.
@@ -146,42 +149,13 @@ def getCutout_process_data(cube, axes_ranges, var, timepoint,
     
     print('\nSuccessfully completed.\n' + '-' * 5)
     sys.stdout.flush()
-    
-    # -----
-    # write the output file.
-    print('\nStep 3: Writing the output matrix to a hdf5 file...\n' + '-' * 25)
-    sys.stdout.flush()
-    
-    # calculate how much time it takes to run step 4.
-    start_time_step3 = time.perf_counter()
-    
-    # write output_data to a hdf5 file.
-    # the output filename specifies the title of the cube, and the x-, y-, and z-ranges so that the file is unique. 1 is added to all of the 
-    # ranges, and the timepoint, because python uses 0-based indices, and the output is desired to be 1-based indices.
-    output_filename = f'{dataset_title}_{var_original}_' + \
-                      f't{timepoint_original}_' + \
-                      f'z{axes_ranges_original[2][0]}-{axes_ranges_original[2][1]}_' + \
-                      f'y{axes_ranges_original[1][0]}-{axes_ranges_original[1][1]}_' + \
-                      f'x{axes_ranges_original[0][0]}-{axes_ranges_original[0][1]}'
-    
-    # writes the output hdf5 file.
-#     cube.write_output_matrix_to_hdf5(output_data, output_filename)
-
-    # writes the output xmf file.
-#     cube.write_xmf(axes_lengths, h5_var_name, h5_attribute_type, h5_dataset_name, output_filename)
-    
-    # calculate how much time it takes to run step 4.
-    end_time_step3 = time.perf_counter()
-    
-    print('\nSuccessfully completed.\n' + '-' * 5)
-    sys.stdout.flush()
 
     end_time = time.perf_counter()
     
     # see how long the program took to run.
     print(f'\nstep 1 time elapsed = {end_time_step1 - start_time_step1:0.3f} seconds ({(end_time_step1 - start_time_step1) / 60:0.3f} minutes)')
     print(f'step 2 time elapsed = {end_time_step2 - start_time_step2:0.3f} seconds ({(end_time_step2 - start_time_step2) / 60:0.3f} minutes)')
-    print(f'step 3 time elapsed = {end_time_step3 - start_time_step3:0.3f} seconds ({(end_time_step3 - start_time_step3) / 60:0.3f} minutes)')
+    # print(f'step 3 time elapsed = {end_time_step3 - start_time_step3:0.3f} seconds ({(end_time_step3 - start_time_step3) / 60:0.3f} minutes)')
     print(f'total time elapsed = {end_time - start_time:0.3f} seconds ({(end_time - start_time) / 60:0.3f} minutes)')
     sys.stdout.flush()
     
