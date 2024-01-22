@@ -25,20 +25,6 @@ except ImportError:
     subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'morton-py'])
 finally:
     import morton
-    
-# installs sympy if necessary.
-try:
-    import sympy
-except ImportError:
-    subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'sympy'])
-    
-# installs pyJHTDB if necessary.
-try:
-    import pyJHTDB
-except ImportError:
-    subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'pyJHTDB'])
-finally:
-    import pyJHTDB
 
 class iso_cube():
     def __init__(self, dataset_title = '', output_path = '', auth_token = '', cube_dimensions = 3, rewrite_dataset_metadata = False, rewrite_interpolation_metadata = False):
@@ -76,13 +62,11 @@ class iso_cube():
         else:
             self.output_path = pathlib.Path(self.output_path)
         
-        # initialize lJHTDB and add the user's authorization token.
-        self.lJHTDB = pyJHTDB.libJHTDB()
-        self.lJHTDB.initialize()
-        self.lJHTDB.add_token(auth_token)
-        
         # create the output directory if it does not already exist.
         create_output_folder(self.output_path)
+        
+        # user authorization token for pyJHTDB.
+        self.auth_token = auth_token
         
         # set the directory for reading the pickled files.
         self.pickle_dir = pathlib.Path(f'/home/idies/workspace/turb/data01_01/zarr/turbulence_pickled')
@@ -473,8 +457,8 @@ class iso_cube():
             # getCutout variables.
             self.getcutout_vars = [self.file_size]
 
-            # getVariable variables.
-            self.getvariable_vars = [self.dataset_title, self.num_values_per_datapoint, self.N, self.chunk_size, self.file_size]
+            # getData variables.
+            self.getdata_vars = [self.dataset_title, self.num_values_per_datapoint, self.N, self.chunk_size, self.file_size]
     
     """
     interpolation functions.
@@ -697,9 +681,9 @@ class iso_cube():
 
         return g
     
-    def interpolate(self, p, u, interpolate_vars):
+    def spatial_interpolate(self, p, u, interpolate_vars):
         """
-        interpolating functions to compute the kernel, extract subcube and convolve.
+        spatial interpolating functions to compute the kernel, extract subcube and convolve.
         
         vars:
          - p is an np.array(3) containing the three coordinates.
@@ -1135,7 +1119,7 @@ class iso_cube():
         return local_output_data
             
     """
-    getVariable functions.
+    getData functions.
     """
     def identify_database_file_points(self, points):
         # vectorize the mortoncurve.pack function.
@@ -1541,7 +1525,7 @@ class iso_cube():
             for db_visitor_map_chunk, worker in zip(db_visitor_map_split, workers):
                 # submit the chunk for parallel processing.
                 temp_visitor_output_data.append(client.submit(self.get_iso_points_variable_visitor, db_visitor_map_chunk,
-                                                              self.getvariable_vars, self.open_file_vars, self.interpolate_vars,
+                                                              self.getdata_vars, self.open_file_vars, self.interpolate_vars,
                                                               workers = worker, pure = False))
                 
             # gather all of the results once they are finished being run in parallel by dask.
@@ -1655,7 +1639,7 @@ class iso_cube():
             for db_visitor_map_chunk, worker in zip(db_visitor_map_split, workers):
                 # submit the data for parallel processing.
                 result_output_data.append(client.submit(self.get_iso_points_variable_visitor, db_visitor_map_chunk,
-                                                        self.getvariable_vars, self.open_file_vars, self.interpolate_vars,
+                                                        self.getdata_vars, self.open_file_vars, self.interpolate_vars,
                                                         workers = worker, pure = False))
         
         # gather all of the results once they are finished being run in parallel by dask.
@@ -1714,18 +1698,18 @@ class iso_cube():
                                 bucket_min_xyz[0] : bucket_max_xyz[0]]
             
                     # interpolate the points and use a lookup table for faster interpolations.
-                    local_output_data.append((original_point_index, (point, self.interpolate(center_point, bucket, interpolate_vars))))
+                    local_output_data.append((original_point_index, (point, self.spatial_interpolate(center_point, bucket, interpolate_vars))))
         
         return local_output_data
     
     def get_iso_points_variable_visitor(self, visitor_data,
-                                        getvariable_vars, open_file_vars, interpolate_vars):
+                                        getdata_vars, open_file_vars, interpolate_vars):
         """
         reads and interpolates the user-requested visitor points.
         """
         # assign the local variables.
         cube_min_index, cube_max_index, sint = interpolate_vars[:3]
-        dataset_title, num_values_per_datapoint, N, chunk_size, file_size = getvariable_vars
+        dataset_title, num_values_per_datapoint, N, chunk_size, file_size = getdata_vars
         
         # get map of the filepaths for all of the dataset files.
         self.init_filepaths(dataset_title)
@@ -1816,7 +1800,7 @@ class iso_cube():
                 current_bucket = bucket_key
 
             # interpolate the point and use a lookup table for faster interpolation.
-            local_output_data.append((point_data[3], (point_data[0], self.interpolate(point_data[2], bucket, interpolate_vars))))
+            local_output_data.append((point_data[3], (point_data[0], self.spatial_interpolate(point_data[2], bucket, interpolate_vars))))
 
         return local_output_data
     

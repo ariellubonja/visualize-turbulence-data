@@ -7,6 +7,20 @@ from giverny.turbulence_toolkit import *
 from giverny.turbulence_gizmos.constants import *
 from giverny.turbulence_gizmos.basic_gizmos import *
 
+# installs sympy if necessary.
+try:
+    import sympy
+except ImportError:
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'sympy'])
+    
+# installs pyJHTDB if necessary.
+try:
+    import pyJHTDB
+except ImportError:
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'pyJHTDB'])
+finally:
+    import pyJHTDB
+
 """
 retrieve a cutout of the isotropic cube.
 """
@@ -96,15 +110,23 @@ def getData(cube, var_original, timepoint_original, temporal_method_original, sp
     # calculate how much time it takes to run the code.
     start_time = time.perf_counter()
     
-    # set attributes.
+    # set cube attributes.
     dataset_title = cube.dataset_title
-    lJHTDB = cube.lJHTDB
+    auth_token = cube.auth_token
     
     # -----
     # housekeeping procedures. will handle multiple variables, e.g. 'pressure' and 'velocity'.
     var, timepoint, temporal_method, spatial_method, spatial_operator = getData_housekeeping_procedures(dataset_title, points, var_original, timepoint_original,
                                                                                                         temporal_method_original, spatial_method_original, spatial_operator_original, option)
     
+    # retrieve the list of datasets processed by the giverny code.
+    giverny_datasets = get_giverny_datasets()
+    
+    # initialize lJHTDB gSOAP resources and add the user's authorization token.
+    if dataset_title not in giverny_datasets:
+        lJHTDB = pyJHTDB.libJHTDB(auth_token = auth_token)
+        lJHTDB.initialize()
+        
     # data constants.
     c = get_constants()
 
@@ -168,9 +190,6 @@ def getData(cube, var_original, timepoint_original, temporal_method_original, sp
         # only return the final point positions to keep consistent with the other "get" functions.
         result = result[-1]
     else:
-        # retrieve the list of datasets processed by the giverny code.
-        giverny_datasets = get_giverny_datasets()
-        
         # retrieve interpolation/differentiation results for the various datasets.
         if dataset_title in giverny_datasets:
             from giverny.turbulence_gizmos.getData import getData_process_data
@@ -189,6 +208,10 @@ def getData(cube, var_original, timepoint_original, temporal_method_original, sp
     output_header = get_interpolation_tsv_header(cube.dataset_title, cube.var_name, timepoint_original, cube.sint, cube.tint)
     result_header = np.array(output_header.split('\n')[1].strip().split('\t'))[3:]
     result = pd.DataFrame(data = result, columns = result_header)
+    
+    # free up gSOAP resources.
+    if dataset_title not in giverny_datasets:
+        lJHTDB.finalize()
     
     # -----
     end_time = time.perf_counter()
