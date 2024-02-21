@@ -944,16 +944,20 @@ class iso_cube():
         """
         # assign the local variables.
         var_name, timepoint, timepoint_digits, dt = open_file_vars
-        
+
         try:
             # try reading from the production file.
-            return zarr.open(f'{db_file}_{str(timepoint).zfill(timepoint_digits)}.zarr{os.sep}{var_name}', dtype = dt, mode = 'r')
+            raise Exception("test reading from backup")
+            return zarr.open(f'{db_file}_{str(timepoint).zfill(timepoint_digits)}.zarr{os.sep}{var_name}', dtype=dt,
+                             mode='r')
         except:
             try:
                 # try reading from the backup file.
-                return zarr.open(f'{db_file_backup}_{str(timepoint).zfill(timepoint_digits)}.zarr{os.sep}{var_name}', dtype = dt, mode = 'r')
+                return zarr.open(f'{db_file_backup}_{str(timepoint).zfill(timepoint_digits)}.zarr{os.sep}{var_name}',
+                                 dtype=dt, mode='r')
             except:
-                raise Exception(f'{db_file}_{str(timepoint).zfill(timepoint_digits)}.zarr{os.sep}{var_name} and the corresponding backup file are not accessible.')
+                raise Exception(
+                    f'{db_file}_{str(timepoint).zfill(timepoint_digits)}.zarr{os.sep}{var_name} and the corresponding backup file are not accessible.')
     
     """
     getCutout functions.
@@ -1010,6 +1014,7 @@ class iso_cube():
 
             current_z = max_corner_xyz[2] + cube_ms[2] + 1
     
+        print(single_file_boxes)
         return single_file_boxes
         
     def read_database_files_sequentially(self, user_single_db_boxes):
